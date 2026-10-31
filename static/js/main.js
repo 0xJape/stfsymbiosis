@@ -109,8 +109,9 @@ function hideScanLoader() {
 const map = new maplibregl.Map({
   container: "map",
   style: "https://tiles.openfreemap.org/styles/liberty",
+  // General Santos City default view; history links override this with ?lat=...&lon=...
   center: [125.1716, 6.1164],
-  zoom: 12,
+  zoom: 11.5,
   pitch: 35,
   bearing: -8,
   attributionControl: false,
