@@ -37,6 +37,8 @@
           <option value="high">High-confidence</option>
           <option value="low">Low-confidence / review</option>
         </select>
+        <label for="history-location-filter">Location</label>
+        <select id="history-location-filter"><option value="all">All locations</option>{% for result in history_results %}<option value="{{ result.lat|round(5) }},{{ result.lon|round(5) }}">{{ result.lat|round(5) }}, {{ result.lon|round(5) }}</option>{% endfor %}</select>
       </div>
     </header>
 
@@ -49,11 +51,12 @@
     <section class="history-chart-card" aria-labelledby="history-chart-title">
       <div><span class="eyebrow">TREND</span><h2 id="history-chart-title">Confidence across scans</h2><p>Each point represents one saved test, oldest to newest.</p></div>
       <canvas id="history-chart" height="260" aria-label="Line graph showing confidence across scans"></canvas>
+      <div class="disease-trend"><span class="eyebrow">CLASS COUNTS</span><div>{% for name, values in disease_trend.items() %}<span>{{ name|title }}: {{ values|length }}</span>{% endfor %}</div></div>
     </section>
 
     <section class="history-page-grid" aria-label="Saved scans">
       {% for result in history_results %}
-      <article class="history-page-card" data-confidence="{{ 'low' if result.inference_status == 'uncertain' else 'high' }}">
+      <article class="history-page-card" data-confidence="{{ 'low' if result.inference_status == 'uncertain' else 'high' }}" data-location="{{ result.lat|round(5) }},{{ result.lon|round(5) }}">
         <img src="{{ result.image_url }}" alt="Saved banana leaf scan">
         <div>
           <span class="history-status{% if result.inference_status == 'uncertain' %} uncertain{% endif %}">
@@ -63,6 +66,7 @@
           <p>{{ (result.confidence * 100)|round(1) }}% confidence</p>
           <p>{{ result.timestamp }}</p>
           <p>{{ result.lat|round(5) }}, {{ result.lon|round(5) }}</p>
+          <a class="history-map-link" href="{{ url_for('map_page') }}?lat={{ result.lat }}&lon={{ result.lon }}">View on map</a>
         </div>
       </article>
       {% else %}
@@ -92,10 +96,10 @@
     };
     addEventListener("resize", drawChart); drawChart();
     const filter = document.getElementById("history-status-filter");
+    const locationFilter = document.getElementById("history-location-filter");
     const cards = [...document.querySelectorAll(".history-page-card")];
-    filter.addEventListener("change", () => cards.forEach((card) => {
-      card.hidden = filter.value !== "all" && card.dataset.confidence !== filter.value;
-    }));
+    const applyFilters = () => cards.forEach((card) => { card.hidden = (filter.value !== "all" && card.dataset.confidence !== filter.value) || (locationFilter.value !== "all" && card.dataset.location !== locationFilter.value); });
+    filter.addEventListener("change", applyFilters); locationFilter.addEventListener("change", applyFilters);
   </script>
 </body>
 </html>

@@ -108,13 +108,20 @@ function hideScanLoader() {
 // ---------------------------------------------------------------------------
 const map = new maplibregl.Map({
   container: "map",
-  style: "https://tiles.openfreemap.org/styles/dark",
+  style: "https://tiles.openfreemap.org/styles/liberty",
   center: [125.1716, 6.1164],
   zoom: 12,
   pitch: 35,
   bearing: -8,
   attributionControl: false,
 });
+const mapFocus = new URLSearchParams(window.location.search);
+const focusLat = Number(mapFocus.get("lat"));
+const focusLon = Number(mapFocus.get("lon"));
+if (Number.isFinite(focusLat) && Number.isFinite(focusLon)) {
+  map.setCenter([focusLon, focusLat]);
+  map.setZoom(15);
+}
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-left");
 map.addControl(new maplibregl.AttributionControl({ compact: true }));
 
@@ -135,6 +142,10 @@ document.querySelectorAll("[data-map-style]").forEach((button) => {
     });
   });
 });
+document.querySelector('[data-map-style="liberty"]')?.classList.add("active");
+document.querySelector('[data-map-style="liberty"]')?.setAttribute("aria-pressed", "true");
+document.querySelector('[data-map-style="dark"]')?.classList.remove("active");
+document.querySelector('[data-map-style="dark"]')?.setAttribute("aria-pressed", "false");
 
 function createMarkerLayer() {
   return { markers: new Set(), visible: true };
