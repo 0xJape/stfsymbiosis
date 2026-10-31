@@ -110,7 +110,7 @@ const map = new maplibregl.Map({
   container: "map",
   style: "https://tiles.openfreemap.org/styles/dark",
   // General Santos City default view; history links override this with ?lat=...&lon=...
-  center: [125.1716, 6.1164],
+  center: [125.17474, 6.13061],
   zoom: 11.5,
   pitch: 35,
   bearing: -8,
@@ -124,7 +124,7 @@ if (Number.isFinite(focusLat) && Number.isFinite(focusLon)) {
   map.setZoom(15);
 } else {
   // Force default on every fresh map page load; prevents browser/map state from restoring elsewhere.
-  map.on("load", () => map.jumpTo({ center: [125.1716, 6.1164], zoom: 11.5, pitch: 35, bearing: -8 }));
+  map.on("load", () => map.jumpTo({ center: [125.17474, 6.13061], zoom: 11.5, pitch: 35, bearing: -8 }));
 }
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-left");
 map.addControl(new maplibregl.AttributionControl({ compact: true }));
