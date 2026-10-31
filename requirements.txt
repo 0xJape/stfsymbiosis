@@ -1,0 +1,15 @@
+flask==3.0.3
+python-dotenv==1.0.1
+requests==2.32.3
+edge-tts>=7.2.8
+langdetect==1.0.9
+gunicorn==22.0.0
+pyttsx3
+
+# Required to load and serve the trained models/best.pt weights.
+onnxruntime
+ultralytics>=8.3.0
+kagglehub==0.3.4
+numpy
+scikit-learn
+matplotlib

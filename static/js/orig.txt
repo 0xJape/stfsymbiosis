@@ -1,0 +1,842 @@
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let currentLat = null;
+let currentLon = null;
+let batchFileList = [];
+let markerLayer = null;
+let selectedLocationMarker = null;
+let lastDetectionContext = null;
+let savedSets = [];
+let activeSetId = null;
+let selectedMapResult = null;
+let chatContextMode = "auto";
+let pendingMessage = null;
+const downloadSummaryBtn = document.getElementById("download-summary-btn");
+const exportFormatSelect = document.getElementById("export-format");
+const setsTabs = document.getElementById("sets-tabs");
+const setDetails = document.getElementById("set-details");
+const clearSetsBtn = document.getElementById("clear-sets-btn");
+const chatContextChoice = document.getElementById("chat-context-choice");
+const contextTabBtn = document.getElementById("context-tab-btn");
+const contextMapBtn = document.getElementById("context-map-btn");
+
+// ---------------------------------------------------------------------------
+// Map
+// ---------------------------------------------------------------------------
+const map = L.map("map").setView([7.0731, 125.6128], 12); // default: General Santos area
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: "&copy; OpenStreetMap contributors",
+  maxZoom: 19,
+}).addTo(map);
+markerLayer = L.layerGroup().addTo(map);
+
+map.on("click", (e) => {
+  setCoords(e.latlng.lat, e.latlng.lng);
+});
+
+function setCoords(lat, lon) {
+  currentLat = lat;
+  currentLon = lon;
+  document.getElementById("lat-input").value = lat.toFixed(6);
+  document.getElementById("lon-input").value = lon.toFixed(6);
+  document.getElementById("coord-hint").textContent =
+    `Coordinates set: ${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  map.setView([lat, lon], 14);
+  renderLocationMarker();
+  updateDetectButtons();
+}
+
+document.getElementById("lat-input").addEventListener("input", syncManualCoords);
+document.getElementById("lon-input").addEventListener("input", syncManualCoords);
+function syncManualCoords() {
+  const lat = parseFloat(document.getElementById("lat-input").value);
+  const lon = parseFloat(document.getElementById("lon-input").value);
+  if (!isNaN(lat) && !isNaN(lon)) {
+    currentLat = lat;
+    currentLon = lon;
+    renderLocationMarker();
+    updateDetectButtons();
+  }
+}
+
+document.getElementById("use-gps-btn").addEventListener("click", () => {
+  if (!navigator.geolocation) {
+    document.getElementById("coord-hint").textContent =
+      "Geolocation not supported - click the map to set coordinates manually.";
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      setCoords(pos.coords.latitude, pos.coords.longitude);
+      map.setView([pos.coords.latitude, pos.coords.longitude], 15);
+    },
+    () => {
+      document.getElementById("coord-hint").textContent =
+        "Location permission denied - click the map to set coordinates manually.";
+    }
+  );
+});
+
+function addResultMarker(r) {
+  const marker = L.circleMarker([r.lat, r.lon], {
+    radius: 9,
+    color: r.color,
+    fillColor: r.color,
+    fillOpacity: 0.85,
+    weight: 2,
+  }).addTo(markerLayer);
+  const severityText = r.severity_pct === null || r.severity_pct === undefined
+    ? "N/A (classification model)"
+    : `${r.severity_pct}%`;
+  const weatherText = r.weather
+    ? `<br>Weather risk: ${r.weather.risk_level} (${r.weather.risk_note})`
+    : "";
+  marker.bindPopup(
+    `<strong>${r.class}</strong><br>Confidence: ${(r.confidence * 100).toFixed(1)}%<br>Severity: ${severityText}${weatherText}${r.mock ? "<br><em>mock result - model not trained yet</em>" : ""}`
+  );
+  marker.on("click", (e) => {
+    selectedMapResult = r;
+    chatContextMode = "auto";
+    updateChatContextChoice();
+    marker.openPopup();
+    L.DomEvent.stop(e);
+  });
+  marker.on("mousedown", L.DomEvent.stop);
+  marker.on("touchstart", L.DomEvent.stop);
+}
+
+function renderLocationMarker() {
+  if (selectedLocationMarker) {
+    markerLayer.removeLayer(selectedLocationMarker);
+    selectedLocationMarker = null;
+  }
+  if (currentLat === null || currentLon === null) return;
+
+  selectedLocationMarker = L.circleMarker([currentLat, currentLon], {
+    radius: 10,
+    color: "#0B6E4F",
+    fillColor: "#1C7A5D",
+    fillOpacity: 0.45,
+    weight: 2,
+    dashArray: "4 3",
+  }).addTo(markerLayer);
+  selectedLocationMarker.bindPopup("Selected planting location").openPopup();
+}
+
+function updateDownloadButton() {
+  downloadSummaryBtn.disabled = !lastDetectionContext;
+}
+
+function getActiveSet() {
+  return savedSets.find((set) => set.id === activeSetId) || null;
+}
+
+function createSetLabel(index) {
+  return `Set ${index + 1}`;
+}
+
+function renderSetTabs() {
+  setsTabs.innerHTML = "";
+  savedSets.forEach((set, index) => {
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = `set-tab${set.id === activeSetId ? " active" : ""}`;
+    tab.textContent = set.label || createSetLabel(index);
+    tab.addEventListener("click", () => {
+      activeSetId = set.id;
+      lastDetectionContext = set.context;
+      chatContextMode = "auto";
+      selectedMapResult = selectedMapResult || null;
+      updateChatContextChoice();
+      renderSetTabs();
+      renderSetDetails();
+      updateDownloadButton();
+    });
+    setsTabs.appendChild(tab);
+  });
+  clearSetsBtn.disabled = savedSets.length === 0;
+}
+
+function renderSetDetails() {
+  const activeSet = getActiveSet();
+  if (!activeSet) {
+    setDetails.innerHTML = `<div class="muted">No saved set selected. Run a detection to create a new set.</div>`;
+    return;
+  }
+
+  const lines = [];
+  lines.push(`<strong>${activeSet.label}</strong>`);
+  lines.push(`Type: ${activeSet.type === "batch" ? "Batch" : "Single"}`);
+  if (activeSet.type === "batch") {
+    lines.push(`Classes: ${Object.keys(activeSet.summary).join(", ")}`);
+    lines.push(`Images: ${activeSet.results.length}`);
+  } else {
+    lines.push(`Detection: ${activeSet.context.class} (${(activeSet.context.confidence * 100).toFixed(1)}%)`);
+  }
+  if (activeSet.weather) {
+    lines.push(`Weather: ${activeSet.weather.conditions || "unknown"}, risk ${activeSet.weather.risk_level}`);
+  }
+  if (activeSet.coordinates) {
+    lines.push(`Coordinates: ${activeSet.coordinates.lat.toFixed(6)}, ${activeSet.coordinates.lon.toFixed(6)}`);
+  }
+
+  setDetails.innerHTML = `
+    <div>${lines.join("<br>")}</div>
+    <button type="button" class="btn btn-outline small" id="remove-active-set-btn">Remove active set</button>
+  `;
+
+  document.getElementById("remove-active-set-btn").addEventListener("click", () => {
+    savedSets = savedSets.filter((set) => set.id !== activeSetId);
+    activeSetId = savedSets.length ? savedSets[savedSets.length - 1].id : null;
+    lastDetectionContext = getActiveSet()?.context || null;
+    chatContextMode = "auto";
+    renderSetTabs();
+    renderSetDetails();
+    updateDownloadButton();
+    updateChatContextChoice();
+  });
+}
+
+function addSavedSet(context) {
+  const id = `set-${Date.now()}`;
+  const label = `Set ${savedSets.length + 1}`;
+  const setObject = {
+    id,
+    label,
+    type: context.batch ? "batch" : "single",
+    context,
+    summary: context.summary || null,
+    results: context.results || (context.batch ? [] : [context]),
+    weather: context.weather || null,
+    coordinates: context.lat != null && context.lon != null ? { lat: context.lat, lon: context.lon } : null,
+  };
+  savedSets.push(setObject);
+  activeSetId = id;
+  lastDetectionContext = context;
+  chatContextMode = "auto";
+  renderSetTabs();
+  renderSetDetails();
+  updateDownloadButton();
+  updateChatContextChoice();
+}
+
+function clearSavedSets() {
+  savedSets = [];
+  activeSetId = null;
+  lastDetectionContext = null;
+  selectedMapResult = null;
+  chatContextMode = "auto";
+  renderSetTabs();
+  renderSetDetails();
+  updateDownloadButton();
+  updateChatContextChoice();
+}
+
+function updateChatContextChoice() {
+  const activeSet = getActiveSet();
+  if (activeSet && selectedMapResult) {
+    chatContextChoice.classList.remove("hidden");
+    return;
+  }
+  chatContextChoice.classList.add("hidden");
+}
+
+clearSetsBtn.addEventListener("click", clearSavedSets);
+contextTabBtn.addEventListener("click", () => {
+  chatContextMode = "tab";
+  chatContextChoice.classList.add("hidden");
+  if (pendingMessage) {
+    sendMessageWithContext(pendingMessage);
+    pendingMessage = null;
+  }
+});
+contextMapBtn.addEventListener("click", () => {
+  chatContextMode = "map";
+  chatContextChoice.classList.add("hidden");
+  if (pendingMessage) {
+    sendMessageWithContext(pendingMessage);
+    pendingMessage = null;
+  }
+});
+
+function resolveChatContext() {
+  const activeSet = getActiveSet();
+  if (chatContextMode === "tab") {
+    return activeSet?.context || null;
+  }
+  if (chatContextMode === "map") {
+    return selectedMapResult || null;
+  }
+  if (activeSet && selectedMapResult) {
+    updateChatContextChoice();
+    return null;
+  }
+  if (selectedMapResult) {
+    return selectedMapResult;
+  }
+  if (activeSet) {
+    return activeSet.context;
+  }
+  return null;
+}
+
+function sendMessageWithContext(message) {
+  addMessage(message, "user");
+  const context = resolveChatContext() || {};
+  fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, context }),
+  })
+    .then((chatRes) => chatRes.json())
+    .then((chatData) => {
+      addMessage(chatData.reply || "Error getting reply.", "bot");
+      if (chatData.offline) {
+        chatModePill.textContent = "local / offline mode";
+        chatModePill.className = "pill small warn";
+      } else {
+        chatModePill.textContent = "online";
+        chatModePill.className = "pill small ok";
+      }
+    })
+    .catch(() => {
+      addMessage("Can't reach the assistant right now. You're in local / offline mode.", "bot");
+      chatModePill.textContent = "local / offline mode";
+      chatModePill.className = "pill small warn";
+    });
+}
+
+function sendMessage() {
+  const message = userInput.value.trim();
+  if (!message) return;
+  const activeSet = getActiveSet();
+  if (activeSet && selectedMapResult && chatContextMode === "auto") {
+    pendingMessage = message;
+    chatContextChoice.classList.remove("hidden");
+    return;
+  }
+  userInput.value = "";
+  pendingMessage = null;
+  sendMessageWithContext(message);
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(`tab-${btn.dataset.tab}`).classList.add("active");
+  });
+});
+
+function updateDetectButtons() {
+  const hasCoords = currentLat !== null && currentLon !== null;
+  document.getElementById("single-detect-btn").disabled = !(hasCoords && singleFile);
+  document.getElementById("batch-detect-btn").disabled = !(hasCoords && batchFileList.length > 0);
+}
+
+downloadSummaryBtn.addEventListener("click", downloadDetectionSummary);
+
+// ---------------------------------------------------------------------------
+// Single image upload
+// ---------------------------------------------------------------------------
+let singleFile = null;
+const singleDropzone = document.getElementById("single-dropzone");
+const singleFileInput = document.getElementById("single-file");
+
+singleDropzone.addEventListener("click", () => {
+  singleFileInput.value = "";
+  singleFileInput.click();
+});
+singleFileInput.addEventListener("change", (e) => {
+  if (e.target.files.length) {
+    singleFile = e.target.files[0];
+    singleDropzone.querySelector(".dz-title").textContent = singleFile.name;
+    updateDetectButtons();
+  }
+});
+["dragover", "dragleave", "drop"].forEach((evt) => {
+  singleDropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    singleDropzone.classList.toggle("drag-over", evt === "dragover");
+    if (evt === "drop" && e.dataTransfer.files.length) {
+      singleFile = e.dataTransfer.files[0];
+      singleDropzone.querySelector(".dz-title").textContent = singleFile.name;
+      updateDetectButtons();
+    }
+  });
+});
+
+document.getElementById("single-detect-btn").addEventListener("click", async () => {
+  if (!singleFile || currentLat === null) return;
+  const btn = document.getElementById("single-detect-btn");
+  btn.disabled = true;
+  btn.textContent = "Detecting\u2026";
+
+  const fd = new FormData();
+  fd.append("image", singleFile);
+  fd.append("lat", currentLat);
+  fd.append("lon", currentLon);
+
+  try {
+    const res = await fetch("/api/detect", { method: "POST", body: fd });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    addSavedSet(data);
+    addResultMarker(data);
+    renderResult(data);
+    updateDownloadButton();
+  } catch (err) {
+    renderError(err.message);
+  } finally {
+    btn.textContent = "Run detection";
+    updateDetectButtons();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Batch upload
+// ---------------------------------------------------------------------------
+const batchDropzone = document.getElementById("batch-dropzone");
+const batchFilesInput = document.getElementById("batch-files");
+
+batchDropzone.addEventListener("click", () => {
+  batchFilesInput.value = null;
+  batchFilesInput.click();
+});
+batchFilesInput.addEventListener("change", (e) => {
+  batchFileList = Array.from(e.target.files);
+  document.getElementById("batch-count").textContent = `${batchFileList.length} images selected`;
+  updateDetectButtons();
+});
+["dragover", "dragleave", "drop"].forEach((evt) => {
+  batchDropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    batchDropzone.classList.toggle("drag-over", evt === "dragover");
+    if (evt === "drop" && e.dataTransfer.files.length) {
+      batchFileList = Array.from(e.dataTransfer.files);
+      document.getElementById("batch-count").textContent = `${batchFileList.length} images selected`;
+      updateDetectButtons();
+    }
+  });
+});
+
+document.getElementById("batch-detect-btn").addEventListener("click", async () => {
+  if (!batchFileList.length || currentLat === null) return;
+  const btn = document.getElementById("batch-detect-btn");
+  btn.disabled = true;
+  btn.textContent = "Detecting\u2026";
+
+  const fd = new FormData();
+  batchFileList.forEach((f) => fd.append("images", f));
+  fd.append("lat", currentLat);
+  fd.append("lon", currentLon);
+
+  try {
+    const res = await fetch("/api/detect_batch", { method: "POST", body: fd });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const batchWeather = data.results.length ? data.results[0].weather : null;
+    const batchContext = {
+      batch: true,
+      summary: data.summary,
+      results: data.results,
+      weather: batchWeather,
+      lat: currentLat,
+      lon: currentLon,
+    };
+    addSavedSet(batchContext);
+    data.results.forEach((r) => {
+      addResultMarker(r);
+      renderResult(r);
+    });
+    updateDownloadButton();
+  } catch (err) {
+    renderError(err.message);
+  } finally {
+    btn.textContent = "Run batch detection";
+    updateDetectButtons();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Results list
+// ---------------------------------------------------------------------------
+function renderResult(r) {
+  const list = document.getElementById("results-list");
+  const empty = list.querySelector(".muted");
+  if (empty) empty.remove();
+
+  const severityText = r.severity_pct === null || r.severity_pct === undefined
+    ? "N/A"
+    : `${r.severity_pct}%`;
+  const weatherText = r.weather
+    ? `<div class="result-sub">Weather: ${r.weather.conditions || 'unknown'}, ${r.weather.temp}°C, humidity ${r.weather.humidity}%, risk ${r.weather.risk_level}</div>`
+    : "";
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.style.borderLeftColor = r.color;
+  card.innerHTML = `
+    <img src="${r.image_url}" alt="leaf">
+    <div class="result-meta">
+      <div class="result-class">${r.class}</div>
+      <div class="result-sub">confidence ${(r.confidence * 100).toFixed(1)}% &middot; severity ${severityText}</div>
+      ${weatherText}
+      ${r.mock ? '<div class="mock-tag">mock result - train the model to replace this</div>' : ""}
+    </div>
+  `;
+  list.prepend(card);
+}
+
+function renderError(message) {
+  const list = document.getElementById("results-list");
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.style.borderLeftColor = "#B23A2E";
+  card.innerHTML = `<div class="result-meta"><div class="result-class">Error</div><div class="result-sub">${message}</div></div>`;
+  list.prepend(card);
+}
+
+// ---------------------------------------------------------------------------
+// Health check (model / assistant status pills)
+// ---------------------------------------------------------------------------
+async function checkHealth() {
+  try {
+    const res = await fetch("/api/health");
+    const data = await res.json();
+    const modelPill = document.getElementById("model-pill");
+    modelPill.textContent = data.model_loaded ? "Model ready" : "Model mock mode";
+    modelPill.className = "pill " + (data.model_loaded ? "ok" : "warn");
+
+    const assistantPill = document.getElementById("assistant-pill");
+    assistantPill.textContent = data.assistant_configured ? "Assistant online" : "Assistant offline";
+    assistantPill.className = "pill " + (data.assistant_configured ? "ok" : "warn");
+
+    const chatModePill = document.getElementById("chat-mode-pill");
+    chatModePill.textContent = data.assistant_configured ? "Online" : "Offline";
+    chatModePill.className = "pill small " + (data.assistant_configured ? "ok" : "warn");
+  } catch {
+    document.getElementById("model-pill").textContent = "model: unknown";
+    document.getElementById("assistant-pill").textContent = "assistant: unreachable";
+  }
+}
+checkHealth();
+
+// ---------------------------------------------------------------------------
+// Chat widget (minimize / maximize / close, offline indicator, TTS)
+// ---------------------------------------------------------------------------
+const chatFab = document.getElementById("chat-fab");
+const chatWindow = document.getElementById("chat-window");
+const chatMinBtn = document.getElementById("chat-min-btn");
+const chatCloseBtn = document.getElementById("chat-close-btn");
+const chatLog = document.getElementById("chat-log");
+const userInput = document.getElementById("user-input");
+const sendBtn = document.getElementById("send-btn");
+const chatModePill = document.getElementById("chat-mode-pill");
+
+chatFab.addEventListener("click", () => {
+  chatWindow.classList.add("open");
+  chatWindow.classList.remove("minimized");
+});
+chatCloseBtn.addEventListener("click", () => {
+  chatWindow.classList.remove("open");
+});
+chatMinBtn.addEventListener("click", () => {
+  chatWindow.classList.toggle("minimized");
+});
+
+const SPEAK_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 9v6h4l5 5V4L7 9H3z" fill="currentColor"/><path d="M16 8a5 5 0 010 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+const LOADING_ICON = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="2" stroke-dasharray="30" stroke-linecap="round"/></svg>`;
+
+function clearEmptyState() {
+  const empty = document.querySelector(".empty-state");
+  if (empty) empty.remove();
+}
+
+function stripMarkdown(text) {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, "$1")   // **bold**
+    .replace(/\*(.*?)\*/g, "$1")       // *italic*
+    .replace(/__(.*?)__/g, "$1")       // __underline__
+    .replace(/_(.*?)_/g, "$1")         // _italic_
+    .replace(/`{1,3}(.*?)`{1,3}/g, "$1") // `code`
+    .replace(/#{1,6}\s?/g, "")         // # headers
+    .replace(/^\s*[-*+]\s+/gm, "")     // bullet points
+    .replace(/\n{2,}/g, ". ")          // extra newlines → pause
+    .trim();
+}
+
+function addMessage(text, sender) {
+  clearEmptyState();
+
+  const wrapper = document.createElement("div");
+  wrapper.className = `msg ${sender}`;
+
+  const displayText = sender === "bot" ? stripMarkdown(text) : text;
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = displayText;
+  wrapper.appendChild(bubble);
+
+  if (sender === "bot") {
+    const speakBtn = document.createElement("button");
+    speakBtn.className = "speak-btn";
+    speakBtn.innerHTML = SPEAK_ICON;
+    speakBtn.title = "Play audio";
+    speakBtn.addEventListener("click", () => playAudio(displayText, speakBtn));
+    wrapper.appendChild(speakBtn);
+  }
+
+  chatLog.appendChild(wrapper);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+async function playAudio(text, btn) {
+  btn.disabled = true;
+  btn.innerHTML = LOADING_ICON;
+
+  try {
+    const res = await fetch("/api/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+
+    if (!res.ok) throw new Error("TTS request failed");
+
+    const audioBlob = await res.blob();
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio(audioUrl);
+    audio.onended = () => URL.revokeObjectURL(audioUrl);
+    audio.onerror = () => {
+      URL.revokeObjectURL(audioUrl);
+      console.error("Audio playback failed");
+    };
+    await audio.play();
+  } catch (err) {
+    console.error(err);
+  } finally {
+    btn.innerHTML = SPEAK_ICON;
+    btn.disabled = false;
+  }
+}
+
+sendBtn.addEventListener("click", sendMessage);
+userInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") sendMessage();
+});
+
+function getSummaryPayload() {
+  const payload = {
+    generated_at: new Date().toISOString(),
+    coordinates: currentLat !== null && currentLon !== null ? {
+      lat: currentLat,
+      lon: currentLon,
+    } : null,
+    weather: lastDetectionContext?.weather || null,
+  };
+
+  if (lastDetectionContext?.batch) {
+    payload.type = "batch";
+    payload.summary = lastDetectionContext.summary || {};
+    payload.results = lastDetectionContext.results || [];
+  } else {
+    payload.type = "single";
+    payload.result = {
+      class: lastDetectionContext.class,
+      confidence: lastDetectionContext.confidence,
+      severity_pct: lastDetectionContext.severity_pct,
+      image_url: lastDetectionContext.image_url,
+      color: lastDetectionContext.color,
+    };
+  }
+
+  return payload;
+}
+
+function formatCsv(payload) {
+  const rows = [];
+  if (payload.type === "batch") {
+    rows.push(["Class", "Count"]);
+    Object.entries(payload.summary).forEach(([cls, count]) => rows.push([cls, count]));
+  } else {
+    rows.push(["Field", "Value"]);
+    rows.push(["Class", payload.result.class]);
+    rows.push(["Confidence", `${(payload.result.confidence * 100).toFixed(1)}%`]);
+    rows.push(["Severity", payload.result.severity_pct == null ? "N/A" : `${payload.result.severity_pct}%`]);
+    rows.push(["Image URL", payload.result.image_url || ""]);
+  }
+  if (payload.weather) {
+    rows.push([]);
+    rows.push(["Weather condition", payload.weather.conditions || "unknown"]);
+    rows.push(["Temperature", payload.weather.temp ?? "N/A"]);
+    rows.push(["Humidity", payload.weather.humidity ?? "N/A"]);
+    rows.push(["Risk level", payload.weather.risk_level || "N/A"]);
+    rows.push(["Risk note", payload.weather.risk_note || ""]);
+  }
+  if (payload.coordinates) {
+    rows.push([]);
+    rows.push(["Latitude", payload.coordinates.lat]);
+    rows.push(["Longitude", payload.coordinates.lon]);
+  }
+  return rows.map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\n");
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function downloadDetectionSummary() {
+  if (!lastDetectionContext) return;
+
+  const payload = getSummaryPayload();
+  const format = exportFormatSelect?.value || "txt";
+  const date = new Date().toISOString().slice(0, 10);
+  let filename = `symbiosis_detection_${date}.${format}`;
+
+  if (format === "json") {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+    downloadBlob(blob, filename);
+    return;
+  }
+
+  if (format === "txt") {
+    let content = "SYMBIOSIS Detection Summary\n\n";
+    if (payload.type === "batch") {
+      content += "Batch results:\n";
+      Object.entries(payload.summary).forEach(([cls, count]) => {
+        content += `- ${count} image(s) classified as ${cls}\n`;
+      });
+    } else {
+      content += `Latest result: ${payload.result.class} (${(payload.result.confidence * 100).toFixed(1)}% confidence)\n`;
+      content += `Severity: ${payload.result.severity_pct == null ? "N/A" : `${payload.result.severity_pct}%`}\n`;
+      if (payload.result.image_url) {
+        content += `Image: ${payload.result.image_url}\n`;
+      }
+    }
+    if (payload.weather) {
+      content += `\nWeather:\n`;
+      content += `Conditions: ${payload.weather.conditions || "unknown"}\n`;
+      content += `Temp: ${payload.weather.temp ?? "N/A"}°C\n`;
+      content += `Humidity: ${payload.weather.humidity ?? "N/A"}%\n`;
+      content += `Risk: ${payload.weather.risk_level || "N/A"}\n`;
+      if (payload.weather.risk_note) {
+        content += `Note: ${payload.weather.risk_note}\n`;
+      }
+    }
+    if (payload.coordinates) {
+      content += `\nCoordinates: ${payload.coordinates.lat.toFixed(6)}, ${payload.coordinates.lon.toFixed(6)}\n`;
+    }
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    downloadBlob(blob, filename);
+    return;
+  }
+
+  if (format === "csv") {
+    filename = `symbiosis_detection_${date}.csv`;
+    const csv = formatCsv(payload);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    downloadBlob(blob, filename);
+    return;
+  }
+
+  if (format === "pdf") {
+    filename = `symbiosis_detection_${date}.pdf`;
+    const { jsPDF } = window.jspdf || {};
+    const doc = jsPDF ? new jsPDF() : null;
+    if (doc) {
+      let y = 16;
+      doc.setFontSize(14);
+      doc.text("SYMBIOSIS Detection Summary", 14, y);
+      doc.setFontSize(11);
+      y += 10;
+      const lines = [];
+      if (payload.type === "batch") {
+        lines.push("Batch results:");
+        Object.entries(payload.summary).forEach(([cls, count]) => {
+          lines.push(`- ${count} image(s) classified as ${cls}`);
+        });
+      } else {
+        lines.push(`Latest result: ${payload.result.class} (${(payload.result.confidence * 100).toFixed(1)}% confidence)`);
+        lines.push(`Severity: ${payload.result.severity_pct == null ? "N/A" : `${payload.result.severity_pct}%`}`);
+        if (payload.result.image_url) {
+          lines.push(`Image: ${payload.result.image_url}`);
+        }
+      }
+      if (payload.weather) {
+        lines.push("", "Weather:");
+        lines.push(`Conditions: ${payload.weather.conditions || "unknown"}`);
+        lines.push(`Temp: ${payload.weather.temp ?? "N/A"}°C`);
+        lines.push(`Humidity: ${payload.weather.humidity ?? "N/A"}%`);
+        lines.push(`Risk: ${payload.weather.risk_level || "N/A"}`);
+        if (payload.weather.risk_note) {
+          lines.push(`Note: ${payload.weather.risk_note}`);
+        }
+      }
+      if (payload.coordinates) {
+        lines.push("", `Coordinates: ${payload.coordinates.lat.toFixed(6)}, ${payload.coordinates.lon.toFixed(6)}`);
+      }
+      lines.forEach((line) => {
+        if (y > 280) {
+          doc.addPage();
+          y = 16;
+        }
+        doc.text(line, 14, y);
+        y += 8;
+      });
+      const pdfBlob = doc.output("blob");
+      downloadBlob(pdfBlob, filename);
+    } else {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+      downloadBlob(blob, `symbiosis_detection_${date}.json`);
+    }
+    return;
+  }
+
+  if (format === "xlsx") {
+    filename = `symbiosis_detection_${date}.xlsx`;
+    const workbook = XLSX.utils.book_new();
+    const sheetData = [];
+    if (payload.type === "batch") {
+      sheetData.push(["Class", "Count"]);
+      Object.entries(payload.summary).forEach(([cls, count]) => sheetData.push([cls, count]));
+    } else {
+      sheetData.push(["Field", "Value"]);
+      sheetData.push(["Class", payload.result.class]);
+      sheetData.push(["Confidence", `${(payload.result.confidence * 100).toFixed(1)}%`]);
+      sheetData.push(["Severity", payload.result.severity_pct == null ? "N/A" : `${payload.result.severity_pct}%`]);
+      sheetData.push(["Image URL", payload.result.image_url || ""]);
+    }
+    if (payload.weather) {
+      sheetData.push([]);
+      sheetData.push(["Weather condition", payload.weather.conditions || "unknown"]);
+      sheetData.push(["Temperature", payload.weather.temp ?? "N/A"]);
+      sheetData.push(["Humidity", payload.weather.humidity ?? "N/A"]);
+      sheetData.push(["Risk level", payload.weather.risk_level || "N/A"]);
+      sheetData.push(["Risk note", payload.weather.risk_note || ""]);
+    }
+    if (payload.coordinates) {
+      sheetData.push([]);
+      sheetData.push(["Latitude", payload.coordinates.lat]);
+      sheetData.push(["Longitude", payload.coordinates.lon]);
+    }
+    const worksheet = XLSX.utils.aoa_to_sheet(sheetData);
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Summary");
+    const wbout = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([wbout], { type: "application/octet-stream" });
+    downloadBlob(blob, filename);
+    return;
+  }
+}
