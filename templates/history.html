@@ -30,11 +30,19 @@
       <h1>Scan history</h1>
       <p>Previous scans ordered from newest to oldest.</p>
       <a class="btn btn-primary" href="{{ url_for('export_history') }}">Export CSV</a>
+      <div class="history-filter" aria-label="Filter scan history">
+        <label for="history-status-filter">Show</label>
+        <select id="history-status-filter">
+          <option value="all">All scans</option>
+          <option value="high">High-confidence</option>
+          <option value="low">Low-confidence / review</option>
+        </select>
+      </div>
     </header>
 
     <section class="history-page-grid" aria-label="Saved scans">
       {% for result in history_results %}
-      <article class="history-page-card">
+      <article class="history-page-card" data-confidence="{{ 'low' if result.inference_status == 'uncertain' else 'high' }}">
         <img src="{{ result.image_url }}" alt="Saved banana leaf scan">
         <div>
           <span class="history-status{% if result.inference_status == 'uncertain' %} uncertain{% endif %}">
@@ -51,5 +59,12 @@
       {% endfor %}
     </section>
   </main>
+  <script>
+    const filter = document.getElementById("history-status-filter");
+    const cards = [...document.querySelectorAll(".history-page-card")];
+    filter.addEventListener("change", () => cards.forEach((card) => {
+      card.hidden = filter.value !== "all" && card.dataset.confidence !== filter.value;
+    }));
+  </script>
 </body>
 </html>
