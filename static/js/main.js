@@ -122,6 +122,9 @@ const focusLon = Number(mapFocus.get("lon"));
 if (Number.isFinite(focusLat) && Number.isFinite(focusLon)) {
   map.setCenter([focusLon, focusLat]);
   map.setZoom(15);
+} else {
+  // Force default on every fresh map page load; prevents browser/map state from restoring elsewhere.
+  map.once("load", () => map.jumpTo({ center: [125.1716, 6.1164], zoom: 11.5, pitch: 35, bearing: -8 }));
 }
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-left");
 map.addControl(new maplibregl.AttributionControl({ compact: true }));
