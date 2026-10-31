@@ -40,6 +40,17 @@
       </div>
     </header>
 
+    <section class="history-summary" aria-label="History summary">
+      <article><span>Total scans</span><strong>{{ summary.total }}</strong></article>
+      <article><span>High confidence</span><strong>{{ summary.high }}</strong></article>
+      <article><span>Needs review</span><strong>{{ summary.low }}</strong></article>
+      <article><span>Confirmed disease findings</span><strong>{{ summary.diseased }}</strong></article>
+    </section>
+    <section class="history-chart-card" aria-labelledby="history-chart-title">
+      <div><span class="eyebrow">TREND</span><h2 id="history-chart-title">Confidence across scans</h2><p>Each point represents one saved test, oldest to newest.</p></div>
+      <canvas id="history-chart" height="260" aria-label="Line graph showing confidence across scans"></canvas>
+    </section>
+
     <section class="history-page-grid" aria-label="Saved scans">
       {% for result in history_results %}
       <article class="history-page-card" data-confidence="{{ 'low' if result.inference_status == 'uncertain' else 'high' }}">
@@ -60,6 +71,26 @@
     </section>
   </main>
   <script>
+    const chartData = {{ chart_data|tojson }};
+    const canvas = document.getElementById("history-chart");
+    const ctx = canvas.getContext("2d");
+    const drawChart = () => {
+      const width = canvas.clientWidth * devicePixelRatio;
+      const height = 260 * devicePixelRatio;
+      canvas.width = width; canvas.height = height;
+      ctx.clearRect(0, 0, width, height);
+      const pad = 34 * devicePixelRatio;
+      ctx.strokeStyle = "#b8cdb7"; ctx.lineWidth = devicePixelRatio;
+      ctx.beginPath(); ctx.moveTo(pad, pad); ctx.lineTo(pad, height - pad); ctx.lineTo(width - pad, height - pad); ctx.stroke();
+      [0, 50, 100].forEach((value) => { const y = height - pad - (value / 100) * (height - pad * 2); ctx.fillStyle = "#b8cdb7"; ctx.font = `${11 * devicePixelRatio}px sans-serif`; ctx.fillText(`${value}%`, 3, y + 4 * devicePixelRatio); });
+      if (!chartData.length) { ctx.fillText("No scan data yet", pad, height / 2); return; }
+      const x = (index) => pad + (index / Math.max(chartData.length - 1, 1)) * (width - pad * 2);
+      const y = (value) => height - pad - (value / 100) * (height - pad * 2);
+      ctx.strokeStyle = "#62e890"; ctx.lineWidth = 3 * devicePixelRatio; ctx.beginPath();
+      chartData.forEach((point, index) => index ? ctx.lineTo(x(index), y(point.confidence)) : ctx.moveTo(x(index), y(point.confidence))); ctx.stroke();
+      chartData.forEach((point, index) => { ctx.fillStyle = point.class === "healthy" ? "#62e890" : "#e8b94a"; ctx.beginPath(); ctx.arc(x(index), y(point.confidence), 4 * devicePixelRatio, 0, Math.PI * 2); ctx.fill(); });
+    };
+    addEventListener("resize", drawChart); drawChart();
     const filter = document.getElementById("history-status-filter");
     const cards = [...document.querySelectorAll(".history-page-card")];
     filter.addEventListener("change", () => cards.forEach((card) => {

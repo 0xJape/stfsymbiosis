@@ -586,9 +586,18 @@ def history_page():
         rows = connection.execute(
             "SELECT * FROM detections ORDER BY created_at DESC LIMIT 500"
         ).fetchall()
-    return render_template(
-        "history.html", history_results=[detection_from_row(row) for row in rows]
-    )
+    history_results = [detection_from_row(row) for row in rows]
+    summary = {
+        "total": len(history_results),
+        "high": sum(result["inference_status"] != "uncertain" for result in history_results),
+        "low": sum(result["inference_status"] == "uncertain" for result in history_results),
+        "diseased": sum(result["class"] != "healthy" and result["inference_status"] != "uncertain" for result in history_results),
+    }
+    chart_data = [
+        {"date": result["timestamp"], "confidence": round(result["confidence"] * 100, 1), "class": result["class"]}
+        for result in reversed(history_results)
+    ]
+    return render_template("history.html", history_results=history_results, summary=summary, chart_data=chart_data)
 
 @app.get("/history/export")
 def export_history():
