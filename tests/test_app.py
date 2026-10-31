@@ -13,7 +13,15 @@ class InputValidationTests(unittest.TestCase):
         app_module.app.config["TESTING"] = True
 
     def setUp(self):
+        self.database_dir = tempfile.TemporaryDirectory()
+        self.original_database_path = app_module.DATABASE_PATH
+        app_module.DATABASE_PATH = os.path.join(self.database_dir.name, "test.db")
+        app_module.init_database()
         self.client = app_module.app.test_client()
+
+    def tearDown(self):
+        app_module.DATABASE_PATH = self.original_database_path
+        self.database_dir.cleanup()
 
     def test_parse_coordinates_accepts_valid_values(self):
         self.assertEqual(app_module.parse_coordinates("7.07", "125.61"), (7.07, 125.61))
@@ -29,6 +37,43 @@ class InputValidationTests(unittest.TestCase):
             with self.subTest(lat=lat, lon=lon):
                 with self.assertRaises(ValueError):
                     app_module.parse_coordinates(lat, lon)
+
+    def test_finalize_inference_marks_low_confidence_for_review(self):
+        result = app_module.finalize_inference(
+            "sigatoka", 0.5, 12, False,
+            [{"class": "healthy", "score": 0.3}, {"class": "sigatoka", "score": 0.5}],
+        )
+        self.assertEqual(result["display_class"], "unknown")
+        self.assertEqual(result["review_status"], "pending")
+        self.assertEqual(result["top_predictions"][0]["class"], "sigatoka")
+
+    def test_review_queue_and_status_update(self):
+        result = {
+            "id": "review-me", "filename": "leaf.png", "class": "sigatoka",
+            "confidence": 0.5, "severity_pct": 10, "mock": False,
+            "lat": 7.0, "lon": 125.0, "color": "#000",
+            "timestamp": "2026-01-01T00:00:00Z", "inference_status": "uncertain",
+            "confidence_threshold": 0.7,
+            "top_predictions": [{"class": "sigatoka", "score": 0.5}],
+            "review_status": "pending",
+        }
+        app_module.save_detection(result)
+        self.assertEqual(len(self.client.get("/api/review").get_json()["results"]), 1)
+        response = self.client.patch(
+            "/api/detections/review-me/review", json={"review_status": "confirmed"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.get("/api/review").get_json()["results"], [])
+
+    def test_review_page_renders(self):
+        response = self.client.get("/review")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Uncertain detections", response.data)
+
+    def test_history_page_renders(self):
+        response = self.client.get("/history")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Scan history", response.data)
 
     def test_safe_image_extension_rejects_untrusted_or_unknown_extensions(self):
         self.assertEqual(app_module.get_safe_image_extension("../../leaf.PNG"), ".png")
@@ -131,9 +176,48 @@ class InputValidationTests(unittest.TestCase):
             self.assertEqual(data["summary"], {"healthy": 2})
             self.assertEqual(len(os.listdir(upload_dir)), 2)
 
+    def test_detection_history_survives_new_request(self):
+        result = {
+            "id": "saved-detection",
+            "filename": "leaf.jpg",
+            "class": "sigatoka",
+            "confidence": 0.87,
+            "severity_pct": None,
+            "mock": False,
+            "lat": 6.1164,
+            "lon": 125.1716,
+            "color": "#B23A2E",
+            "timestamp": "2026-10-31T00:00:00Z",
+        }
+        app_module.save_detection(result)
+
+        response = self.client.get("/api/history")
+
+        self.assertEqual(response.status_code, 200)
+        saved = response.get_json()["groups"][0]["results"][0]
+        self.assertEqual(saved["id"], "saved-detection")
+        self.assertEqual(saved["class"], "sigatoka")
+
     def test_weather_rejects_invalid_coordinates(self):
         response = self.client.get("/api/weather?lat=NaN&lon=10")
         self.assertEqual(response.status_code, 400)
+
+    def test_spatiotemporal_requires_three_valid_boundary_points(self):
+        response = self.client.post("/api/spatiotemporal", json={"boundary": [{"lat": 6, "lon": 125}]})
+        self.assertEqual(response.status_code, 400)
+
+    def test_spatiotemporal_analyzes_selected_boundary(self):
+        expected = {"sample_count": 4, "timeline": [], "summary": {"favorable_days": 0}}
+        boundary = [
+            {"lat": 6.10, "lon": 125.10},
+            {"lat": 6.20, "lon": 125.10},
+            {"lat": 6.15, "lon": 125.20},
+        ]
+        with patch.object(app_module, "fetch_boundary_temperature", return_value=expected) as fetch:
+            response = self.client.post("/api/spatiotemporal", json={"boundary": boundary})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        self.assertEqual(len(fetch.call_args.args[0]), 3)
 
     def test_speak_rejects_malformed_request_without_running_tts(self):
         response = self.client.post("/api/speak", data="not json", content_type="text/plain")

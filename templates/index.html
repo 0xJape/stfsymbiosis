@@ -23,7 +23,7 @@
   3. If no file is present, a generated leaf monogram is shown instead as a placeholder.
 -->
 </head>
-<body class="{% if diagnose_page %}diagnose-page workspace-{{ workspace_tab }}{% endif %}">
+<body class="{% if diagnose_page %}diagnose-page workspace-{{ workspace_tab }}{% endif %}{% if review_page %} review-page{% endif %}">
 
 <div class="scroll-progress" id="scroll-progress" aria-hidden="true"></div>
 
@@ -44,6 +44,8 @@
     <a href="{{ url_for('index') }}"{% if not diagnose_page %} class="active" aria-current="page"{% endif %}>Home</a>
     <a href="{{ url_for('diagnose') }}"{% if workspace_tab == 'detect' %} class="active" aria-current="page"{% endif %}>Detect</a>
     <a href="{{ url_for('map_page') }}"{% if workspace_tab == 'map' %} class="active" aria-current="page"{% endif %}>Map</a>
+    <a href="{{ url_for('review_page') }}"{% if workspace_tab == 'review' %} class="active" aria-current="page"{% endif %}>Review</a>
+    <a href="{{ url_for('history_page') }}"{% if workspace_tab == 'history' %} class="active" aria-current="page"{% endif %}>History</a>
     {% if not diagnose_page %}<a href="#model-info">Model</a><a href="#notes">Notes</a>{% endif %}
   </nav>
 
@@ -183,6 +185,45 @@
 
 <main class="layout">
 
+  {% if review_page %}
+  <section class="review-workspace" aria-labelledby="review-title">
+    <div class="review-hero">
+      <span class="eyebrow">CONFIDENCE REVIEW</span>
+      <h1 id="review-title">Uncertain detections</h1>
+      <p>Predictions below {{ (confidence_threshold * 100)|round|int }}% remain unconfirmed until reviewed or rescanned.</p>
+    </div>
+    <div class="review-list" id="review-list" aria-live="polite">
+      <p class="muted">Loading review queue…</p>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if history_page %}
+  <section class="review-workspace" aria-labelledby="history-title">
+    <div class="review-hero">
+      <span class="eyebrow">LOCAL RECORDS</span>
+      <h1 id="history-title">Scan history</h1>
+      <p>Previous scans organized by date, location, and classification.</p>
+    </div>
+    <div class="history-list" id="history-list">
+      {% for result in history_results %}
+      <article class="history-card">
+        <div class="history-row">
+          <img src="{{ result.image_url }}" alt="Saved banana leaf scan">
+          <div>
+            <strong>{% if result.inference_status == 'uncertain' %}Uncertain{% else %}{{ result.class|title }}{% endif %}</strong>
+            <span>{{ result.timestamp }} · {{ (result.confidence * 100)|round(1) }}%</span>
+            <span>{{ result.lat|round(5) }}, {{ result.lon|round(5) }}</span>
+          </div>
+        </div>
+      </article>
+      {% else %}
+      <p class="review-empty">No saved scans yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
   {% if diagnose_page %}
   <div class="workspace-hud" aria-hidden="true">
     <span><i></i> FIELD INTELLIGENCE LIVE</span>
@@ -321,6 +362,16 @@
       <span class="eyebrow">Plantation health map</span>
       <h2>Disease density by location</h2>
     </div>
+    <div class="boundary-tools" aria-label="Area temperature analysis">
+      <label class="boundary-count">Dots
+        <input id="boundary-count-input" type="number" min="3" max="25" value="4" inputmode="numeric">
+      </label>
+      <button class="boundary-btn" id="boundary-mode-btn" type="button" aria-pressed="false">Select boundary</button>
+      <button class="boundary-btn" id="boundary-finish-btn" type="button" disabled>Analyze area</button>
+      <button class="boundary-clear" id="boundary-clear-btn" type="button" hidden>Clear</button>
+      <span id="boundary-status" aria-live="polite">Place 4 dots around an area.</span>
+      <div class="boundary-result" id="boundary-result" hidden></div>
+    </div>
     <div id="map" role="region" aria-label="Interactive plantation health map"></div>
     <div class="legend">
       <span><i style="background:#4A7C59"></i> Healthy</span>
@@ -329,6 +380,31 @@
       <span><i style="background:#B23A2E"></i> Sigatoka</span>
     </div>
   </section>
+
+  <div class="temporal-modal" id="temporal-modal" role="dialog" aria-modal="true" aria-labelledby="temporal-title" hidden>
+    <div class="temporal-modal-card">
+      <button class="temporal-modal-close" id="temporal-modal-close" type="button" aria-label="Close area analysis">×</button>
+      <span class="temporal-kicker">SYMBIOSIS // SPATIOTEMPORAL AI</span>
+      <h2 id="temporal-title">Boundary intelligence</h2>
+      <div class="temporal-scan"><i></i></div>
+      <div id="temporal-modal-content"></div>
+    </div>
+  </div>
+
+  <div class="temporal-modal" id="export-loading-modal" role="dialog" aria-modal="true" aria-labelledby="export-loading-title" hidden>
+    <div class="temporal-modal-card export-loading-card">
+      <div class="eyebrow">SYMBIOSIS EXPORT</div>
+      <h2 id="export-loading-title">Preparing report</h2>
+      <div class="export-spinner" aria-hidden="true"></div>
+      <p id="export-loading-status">Fetching environmental context and generating AI explanation…</p>
+      <p class="muted">Please keep this window open. Report downloads when data is ready.</p>
+    </div>
+  </div>
+  <div class="boundary-loader" id="boundary-loader" role="status" aria-live="polite" hidden>
+    <div class="boundary-loader-core"><i></i><i></i><span></span></div>
+    <strong>INITIALIZING BOUNDARY VISION</strong>
+    <p>Calibrating spatial nodes and thermal grid…</p>
+  </div>
 
 </main>
 

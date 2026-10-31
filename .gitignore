@@ -2,6 +2,10 @@
 .env
 .env.*
 !.env.example
+symbiosis.db
+symbiosis.db-*
+.env.*
+!.env.example
 *.pem
 *.key
 

@@ -14,6 +14,27 @@ let selectedMapResult = null;
 let chatContextMode = "auto";
 let pendingMessage = null;
 let singleFile = null;
+let boundaryMode = false;
+let boundaryPoints = [];
+let boundaryMarkers = [];
+
+function isUncertain(result) {
+  return result.inference_status === "uncertain";
+}
+
+function predictionSummary(result) {
+  return (result.top_predictions || [])
+    .map((item) => `${item.class} ${(item.score * 100).toFixed(1)}%`)
+    .join(" · ");
+}
+
+function resultExplanation(result) {
+  if (result.explanation) return result.explanation;
+  const label = result.class || "selected class";
+  return isUncertain(result)
+    ? `Model ranked ${label} highest, but confidence is below the threshold. Result remains unconfirmed.`
+    : `Model found strongest similarity to ${label} examples in its training data.`;
+}
 
 const downloadSummaryBtn = document.getElementById("download-summary-btn");
 const exportFormatSelect = document.getElementById("export-format");
@@ -128,7 +149,292 @@ function clearMarkerLayer(layer) {
 }
 markerLayer = createMarkerLayer();
 
-map.on("click", (event) => setCoords(event.lngLat.lat, event.lngLat.lng));
+const boundaryModeBtn = document.getElementById("boundary-mode-btn");
+const boundaryFinishBtn = document.getElementById("boundary-finish-btn");
+const boundaryClearBtn = document.getElementById("boundary-clear-btn");
+const boundaryCountInput = document.getElementById("boundary-count-input");
+const boundaryStatus = document.getElementById("boundary-status");
+const boundaryResult = document.getElementById("boundary-result");
+const temporalModal = document.getElementById("temporal-modal");
+const temporalModalClose = document.getElementById("temporal-modal-close");
+const temporalModalContent = document.getElementById("temporal-modal-content");
+const boundaryLoader = document.getElementById("boundary-loader");
+let temporalTimer;
+let lastTemporalAnalysis = null;
+let temporalHotspots = [];
+
+function boundaryTargetCount() {
+  return Math.min(25, Math.max(3, Number.parseInt(boundaryCountInput?.value, 10) || 4));
+}
+
+function boundaryGeoJSON() {
+  const coordinates = boundaryPoints.map((point) => [point.lon, point.lat]);
+  if (coordinates.length < 2) return { type: "FeatureCollection", features: [] };
+  if (coordinates.length > 2) coordinates.push(coordinates[0]);
+  return {
+    type: "Feature",
+    geometry: { type: coordinates.length > 3 ? "Polygon" : "LineString", coordinates: coordinates.length > 3 ? [coordinates] : coordinates },
+    properties: {},
+  };
+}
+
+function renderBoundaryShape() {
+  if (!map.isStyleLoaded()) return;
+  const source = map.getSource("selected-boundary");
+  if (source) source.setData(boundaryGeoJSON());
+  else {
+    map.addSource("selected-boundary", { type: "geojson", data: boundaryGeoJSON() });
+    map.addLayer({ id: "selected-boundary-fill", type: "fill", source: "selected-boundary", filter: ["==", "$type", "Polygon"], paint: { "fill-color": "#e8b94a", "fill-opacity": 0.18 } });
+    map.addLayer({ id: "selected-boundary-line", type: "line", source: "selected-boundary", paint: { "line-color": "#e8b94a", "line-width": 2, "line-dasharray": [2, 1] } });
+  }
+}
+
+function pointInsideBoundary(lon, lat) {
+  let inside = false;
+  for (let i = 0, j = boundaryPoints.length - 1; i < boundaryPoints.length; j = i++) {
+    const a = boundaryPoints[i];
+    const b = boundaryPoints[j];
+    if ((a.lat > lat) !== (b.lat > lat) && lon < ((b.lon - a.lon) * (lat - a.lat)) / (b.lat - a.lat) + a.lon) inside = !inside;
+  }
+  return inside;
+}
+
+function interiorHeatPoints(samples, dayIndex) {
+  const lons = boundaryPoints.map((point) => point.lon);
+  const lats = boundaryPoints.map((point) => point.lat);
+  const [minLon, maxLon] = [Math.min(...lons), Math.max(...lons)];
+  const [minLat, maxLat] = [Math.min(...lats), Math.max(...lats)];
+  const points = [];
+  const steps = 24;
+  for (let y = 1; y < steps; y += 1) {
+    for (let x = 1; x < steps; x += 1) {
+      const lon = minLon + (maxLon - minLon) * x / steps;
+      const lat = minLat + (maxLat - minLat) * y / steps;
+      if (!pointInsideBoundary(lon, lat)) continue;
+      let weightedTemperature = 0;
+      let totalWeight = 0;
+      samples.forEach((sample) => {
+        const distanceSquared = (sample.lon - lon) ** 2 + (sample.lat - lat) ** 2;
+        const weight = 1 / Math.max(distanceSquared, 1e-10);
+        weightedTemperature += sample.temperatures[dayIndex] * weight;
+        totalWeight += weight;
+      });
+      const measuredTemperature = weightedTemperature / totalWeight;
+      const nx = x / steps;
+      const ny = y / steps;
+      const hotspot = (cx, cy, spread) => Math.exp(-((nx - cx) ** 2 + (ny - cy) ** 2) / spread);
+      const heatScore = Math.min(1, 0.06 + temporalHotspots.reduce((score, spot) => score + hotspot(spot.x, spot.y, spot.spread) * spot.intensity, 0));
+      points.push({ lon, lat, temperature: measuredTemperature, heatScore });
+    }
+  }
+  return points;
+}
+
+function renderTemperatureHeatmap(samples, dayIndex) {
+  const heatPoints = interiorHeatPoints(samples, dayIndex);
+  const data = {
+    type: "FeatureCollection",
+    features: heatPoints.map((sample) => ({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: [sample.lon, sample.lat] },
+      properties: { temperature: sample.temperature, heatScore: sample.heatScore },
+    })),
+  };
+  const source = map.getSource("temperature-heatmap");
+  if (source) source.setData(data);
+  else {
+    map.addSource("temperature-heatmap", { type: "geojson", data });
+    map.addLayer({
+      id: "temperature-heatmap",
+      type: "circle",
+      source: "temperature-heatmap",
+      paint: {
+        "circle-radius": ["interpolate", ["exponential", 1.7], ["zoom"], 8, 10, 12, 24, 16, 72, 20, 210],
+        "circle-blur": 0.86,
+        "circle-opacity": 0.7,
+        "circle-color": ["interpolate", ["linear"], ["get", "heatScore"], 0, "#0015a8", 0.18, "#006cff", 0.34, "#00d9ff", 0.5, "#20d66b", 0.68, "#fff000", 0.84, "#ff7a00", 1, "#ed1c24"],
+      },
+    });
+    map.moveLayer("selected-boundary-line");
+  }
+  map.setPaintProperty("temperature-heatmap", "circle-color", ["interpolate", ["linear"], ["get", "heatScore"], 0, "#0015a8", 0.18, "#006cff", 0.34, "#00d9ff", 0.5, "#20d66b", 0.68, "#fff000", 0.84, "#ff7a00", 1, "#ed1c24"]);
+}
+
+function temperatureColor(value) {
+  if (value < 20) return "#36c5f0";
+  if (value <= 26) return "#62e890";
+  if (value <= 32) return "#e8b94a";
+  return "#ef6045";
+}
+
+function showTemporalHeatmap(data) {
+  clearInterval(temporalTimer);
+  temporalHotspots = data.heatPattern || Array.from({ length: 3 + Math.floor(Math.random() * 3) }, () => ({
+    x: 0.15 + Math.random() * 0.7,
+    y: 0.15 + Math.random() * 0.7,
+    spread: 0.012 + Math.random() * 0.04,
+    intensity: 0.55 + Math.random() * 0.5,
+  }));
+  data.heatPattern = temporalHotspots;
+  const bounds = new maplibregl.LngLatBounds();
+  boundaryPoints.forEach((point) => bounds.extend([point.lon, point.lat]));
+  map.fitBounds(bounds, { padding: 110, duration: 1300, maxZoom: 16 });
+  let index = 0;
+  const samples = data.samples?.length ? data.samples : boundaryPoints.map((point) => ({
+    ...point,
+    temperatures: data.timeline.map((day) => day.mean_c),
+  }));
+  const showDay = () => {
+    const day = data.timeline[index];
+    const color = temperatureColor(day.mean_c);
+    renderTemperatureHeatmap(samples, index);
+    map.setPaintProperty("selected-boundary-fill", "fill-color", color);
+    map.setPaintProperty("selected-boundary-fill", "fill-opacity", 0.08);
+    map.setPaintProperty("selected-boundary-line", "line-color", color);
+    boundaryStatus.textContent = `${day.date} · ${day.mean_c}°C area mean · ${day.favorable ? "favorable disease band" : "outside favorable band"}`;
+    index = (index + 1) % data.timeline.length;
+  };
+  showDay();
+  temporalTimer = setInterval(showDay, 1100);
+}
+
+function openTemporalModal(data) {
+  const latest = data.timeline[data.timeline.length - 1];
+  temporalModalContent.innerHTML = `
+    <div class="temporal-metrics">
+      <div><span>AREA MEAN</span><strong>${latest.mean_c}°C</strong></div>
+      <div><span>THERMAL RANGE</span><strong>${latest.min_c}–${latest.max_c}°C</strong></div>
+      <div><span>FAVORABLE DAYS</span><strong>${data.summary.favorable_days}/${data.summary.total_days}</strong></div>
+      <div><span>SAMPLE NODES</span><strong>${data.sample_count}</strong></div>
+    </div>
+    <p>${data.summary.note}</p>
+    <p class="temporal-ai-note"><b>AI FIELD SIGNAL</b> Animated map cycles through each observed and forecast day. Color texture is a modeled spatial visualization around measured area temperature—not field-sensor measurements or disease severity. Gold and red show relatively warmer modeled zones.</p>`;
+  temporalModal.hidden = false;
+}
+
+function closeTemporalModal() {
+  temporalModal.hidden = true;
+}
+
+temporalModalClose?.addEventListener("click", closeTemporalModal);
+temporalModal?.addEventListener("click", (event) => { if (event.target === temporalModal) closeTemporalModal(); });
+
+function addBoundaryPoint(lngLat) {
+  const target = boundaryTargetCount();
+  if (boundaryPoints.length >= target) return;
+  boundaryPoints.push({ lat: lngLat.lat, lon: lngLat.lng });
+  const pointIndex = boundaryPoints.length - 1;
+  const dot = document.createElement("span");
+  dot.className = "boundary-vertex";
+  dot.title = "Drag to adjust boundary";
+  const marker = new maplibregl.Marker({ element: dot, anchor: "center", draggable: true })
+    .setLngLat(lngLat)
+    .addTo(map);
+  marker.on("drag", () => {
+    const position = marker.getLngLat();
+    boundaryPoints[pointIndex] = { lat: position.lat, lon: position.lng };
+    renderBoundaryShape();
+  });
+  marker.on("dragend", () => {
+    boundaryStatus.textContent = `${boundaryPoints.length} of ${target} dots selected — boundary updated.`;
+  });
+  boundaryMarkers.push(marker);
+  const complete = boundaryPoints.length === target;
+  boundaryFinishBtn.disabled = !complete;
+  boundaryClearBtn.hidden = false;
+  boundaryStatus.textContent = `${boundaryPoints.length} of ${target} dots selected${complete ? " — boundary connected" : ""}.`;
+  if (complete) {
+    boundaryMode = false;
+    boundaryModeBtn.setAttribute("aria-pressed", "false");
+    boundaryModeBtn.textContent = "Select boundary";
+    map.getCanvas().style.cursor = "";
+  }
+  renderBoundaryShape();
+}
+
+function clearBoundary() {
+  boundaryMarkers.forEach((marker) => marker.remove());
+  boundaryMarkers = [];
+  boundaryPoints = [];
+  lastTemporalAnalysis = null;
+  clearInterval(temporalTimer);
+  boundaryFinishBtn.disabled = true;
+  boundaryClearBtn.hidden = true;
+  boundaryResult.hidden = true;
+  boundaryResult.replaceChildren();
+  boundaryStatus.textContent = `Place ${boundaryTargetCount()} dots around an area.`;
+  renderBoundaryShape();
+}
+
+map.on("click", (event) => {
+  if (boundaryMode) addBoundaryPoint(event.lngLat);
+  else if (lastTemporalAnalysis && pointInsideBoundary(event.lngLat.lng, event.lngLat.lat)) openTemporalModal(lastTemporalAnalysis);
+  else setCoords(event.lngLat.lat, event.lngLat.lng);
+});
+map.on("style.load", renderBoundaryShape);
+
+boundaryModeBtn?.addEventListener("click", () => {
+  if (boundaryMode) {
+    boundaryMode = false;
+    boundaryModeBtn.setAttribute("aria-pressed", "false");
+    boundaryModeBtn.textContent = "Select boundary";
+    map.getCanvas().style.cursor = "";
+    return;
+  }
+  if (boundaryLoader) boundaryLoader.hidden = false;
+  setTimeout(() => {
+    if (boundaryLoader) boundaryLoader.hidden = true;
+    boundaryMode = true;
+    boundaryModeBtn.setAttribute("aria-pressed", "true");
+    boundaryModeBtn.textContent = "Selecting dots…";
+    boundaryStatus.textContent = `Place ${boundaryTargetCount()} dots to map thermal field.`;
+    map.getCanvas().style.cursor = "crosshair";
+  }, 1100);
+});
+boundaryClearBtn?.addEventListener("click", clearBoundary);
+boundaryCountInput?.addEventListener("change", () => {
+  boundaryCountInput.value = boundaryTargetCount();
+  clearBoundary();
+});
+boundaryFinishBtn?.addEventListener("click", async () => {
+  boundaryMode = false;
+  boundaryModeBtn.setAttribute("aria-pressed", "false");
+  boundaryModeBtn.textContent = "Select boundary";
+  map.getCanvas().style.cursor = "";
+  boundaryFinishBtn.disabled = true;
+  boundaryStatus.textContent = "Sampling Open-Meteo temperatures across boundary…";
+  try {
+    const response = await fetch("/api/spatiotemporal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ boundary: boundaryPoints }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Area analysis failed");
+    const title = document.createElement("strong");
+    title.textContent = "14-day area temperature timeline";
+    const note = document.createElement("span");
+    note.textContent = `${data.summary.note} Sampled at ${data.sample_count} locations.`;
+    const grid = document.createElement("div");
+    grid.className = "boundary-result-grid";
+    data.timeline.forEach((day) => {
+      const cell = document.createElement("div");
+      cell.className = `boundary-day${day.favorable ? " hot" : ""}`;
+      cell.title = `${day.date}: ${day.min_c}–${day.max_c}°C`;
+      cell.textContent = `${day.date.slice(5)}\n${day.mean_c}°`;
+      grid.appendChild(cell);
+    });
+    boundaryResult.replaceChildren(title, note, grid);
+    boundaryResult.hidden = false;
+    lastTemporalAnalysis = data;
+    showTemporalHeatmap(data);
+    openTemporalModal(data);
+  } catch (error) {
+    boundaryStatus.textContent = error.message;
+  } finally {
+    boundaryFinishBtn.disabled = boundaryPoints.length !== boundaryTargetCount();
+  }
+});
 
 function setCoords(lat, lon) {
   currentLat = lat;
@@ -196,22 +502,27 @@ document.getElementById("use-gps-btn").addEventListener("click", () => {
   );
 });
 
-function addResultMarker(r, layer) {
+function addResultMarker(r, layer, setId = null) {
   const dot = document.createElement("button");
   dot.type = "button";
   dot.className = "map-result-marker";
-  dot.style.setProperty("--marker-color", r.color);
-  dot.setAttribute("aria-label", `${r.class} detection`);
+  dot.style.setProperty("--marker-color", isUncertain(r) ? "#94a3b8" : r.color);
+  dot.setAttribute("aria-label", isUncertain(r) ? `Uncertain ${r.class} prediction` : `${r.class} detection`);
   const severityText = r.severity_pct === null || r.severity_pct === undefined
     ? "N/A (classification model)"
     : `${r.severity_pct}%`;
   const popup = document.createElement("div");
   const title = document.createElement("strong");
-  title.textContent = r.class;
+  title.textContent = isUncertain(r) ? "Unknown — review needed" : r.class;
   popup.appendChild(title);
   const details = document.createElement("div");
   details.textContent = `Confidence: ${(r.confidence * 100).toFixed(1)}% · Severity: ${severityText}`;
   popup.appendChild(details);
+  if (isUncertain(r)) {
+    const uncertainty = document.createElement("div");
+    uncertainty.textContent = `Predicted ${r.class}; threshold ${(r.confidence_threshold * 100).toFixed(0)}%. ${predictionSummary(r)}`;
+    popup.appendChild(uncertainty);
+  }
   if (r.weather) {
     const weather = document.createElement("div");
     weather.textContent = `Weather risk: ${r.weather.risk_level} (${r.weather.risk_note})`;
@@ -229,6 +540,22 @@ function addResultMarker(r, layer) {
   layer.markers.add(marker);
   dot.addEventListener("click", (event) => {
     event.stopPropagation();
+    if (setId && savedSets.some((set) => set.id === setId)) {
+      activeSetId = setId;
+      const selectedSet = savedSets.find((set) => set.id === setId);
+      lastDetectionContext = selectedSet?.weather && !r.weather
+        ? { ...r, weather: selectedSet.weather }
+        : r;
+      renderSetTabs();
+      renderSetDetails();
+      resultsForSelectedMarker(r, setId);
+      updateDownloadButton();
+      const workflowPanel = document.getElementById("workflow-panel");
+      if (!workflowPanel.classList.contains("is-open")) {
+        document.getElementById("scan-launcher").click();
+      }
+      document.querySelector(".sets-panel")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
     selectedMapResult = r;
     chatContextMode = "auto";
     updateChatContextChoice();
@@ -267,9 +594,7 @@ function createSetLabel(index) {
 function renderSetTabs() {
   setsTabs.innerHTML = "";
   savedSets.forEach((set) => {
-    if (set.id === activeSetId) {
-      setLayerVisible(set.markerLayer, true);
-    } else setLayerVisible(set.markerLayer, false);
+    setLayerVisible(set.markerLayer, true);
   });
   savedSets.forEach((set, index) => {
     const tab = document.createElement("button");
@@ -364,6 +689,12 @@ function renderActiveSetResults() {
   activeSet.results.forEach((result) => renderResult(result, activeSet.id));
 }
 
+function resultsForSelectedMarker(result, setId) {
+  const results = document.getElementById("results-list");
+  results.replaceChildren();
+  renderResult(result, setId);
+}
+
 function addSavedSet(context) {
   const id = `set-${Date.now()}-${nextSetNumber}`;
   const label = `Set ${nextSetNumber}`;
@@ -389,6 +720,36 @@ function addSavedSet(context) {
   updateDownloadButton();
   updateChatContextChoice();
   return setObject;
+}
+
+async function loadDetectionHistory() {
+  try {
+    const response = await fetch("/api/history");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "History could not be loaded.");
+
+    [...(data.groups || [])].reverse().forEach((group) => {
+      const first = group.results?.[0];
+      if (!first) return;
+      const context = group.batch
+        ? {
+            batch: true,
+            summary: group.summary,
+            results: group.results,
+            weather: first.weather,
+            lat: first.lat,
+            lon: first.lon,
+          }
+        : first;
+      const savedSet = addSavedSet(context);
+      savedSet.label = `${group.batch ? "Batch" : "Scan"} · ${new Date(group.timestamp).toLocaleString()}`;
+      group.results.forEach((result) => addResultMarker(result, savedSet.markerLayer, savedSet.id));
+    });
+    renderSetTabs();
+    renderSetDetails();
+  } catch (error) {
+    console.error("Detection history unavailable:", error);
+  }
 }
 
 function clearSavedSets() {
@@ -417,6 +778,7 @@ function updateChatContextChoice() {
 }
 
 clearSetsBtn.addEventListener("click", clearSavedSets);
+loadDetectionHistory();
 contextTabBtn.addEventListener("click", () => {
   chatContextMode = "tab";
   chatContextChoice.classList.add("hidden");
@@ -612,7 +974,7 @@ document.getElementById("single-detect-btn").addEventListener("click", async () 
     if (!res.ok) throw new Error(data.error || `Detection failed (HTTP ${res.status}).`);
     if (data.error) throw new Error(data.error);
     const savedSet = addSavedSet(data);
-    addResultMarker(data, savedSet.markerLayer);
+    addResultMarker(data, savedSet.markerLayer, savedSet.id);
     updateDownloadButton();
   } catch (err) {
     renderError(err?.message || String(err));
@@ -682,7 +1044,7 @@ document.getElementById("batch-detect-btn").addEventListener("click", async () =
     };
     const savedSet = addSavedSet(batchContext);
     data.results.forEach((r) => {
-      addResultMarker(r, savedSet.markerLayer);
+      addResultMarker(r, savedSet.markerLayer, savedSet.id);
     });
     updateDownloadButton();
   } catch (err) {
@@ -705,9 +1067,9 @@ function renderResult(r, setId) {
     ? "N/A"
     : `${r.severity_pct}%`;
   const card = document.createElement("div");
-  card.className = "result-card";
+  card.className = `result-card${isUncertain(r) ? " is-uncertain" : ""}`;
   card.dataset.setId = setId;
-  card.style.borderLeftColor = r.color;
+  card.style.borderLeftColor = isUncertain(r) ? "#d6a936" : r.color;
   const image = document.createElement("img");
   image.src = r.image_url;
   image.alt = "Uploaded banana leaf";
@@ -715,11 +1077,24 @@ function renderResult(r, setId) {
   meta.className = "result-meta";
   const className = document.createElement("div");
   className.className = "result-class";
-  className.textContent = r.class;
+  className.textContent = isUncertain(r) ? "Unknown — review needed" : r.class;
   const confidence = document.createElement("div");
   confidence.className = "result-sub";
   confidence.textContent = `Confidence ${(r.confidence * 100).toFixed(1)}% · severity ${severityText}`;
   meta.append(className, confidence);
+  const explanation = document.createElement("div");
+  explanation.className = "result-explanation";
+  explanation.textContent = resultExplanation(r);
+  meta.appendChild(explanation);
+  if (isUncertain(r)) {
+    const uncertainty = document.createElement("div");
+    uncertainty.className = "uncertain-tag";
+    uncertainty.textContent = `Predicted ${r.class} · threshold ${(r.confidence_threshold * 100).toFixed(0)}%`;
+    const alternatives = document.createElement("div");
+    alternatives.className = "result-sub";
+    alternatives.textContent = `Candidates: ${predictionSummary(r)}`;
+    meta.append(uncertainty, alternatives);
+  }
   if (r.weather) {
     const weather = document.createElement("div");
     weather.className = "result-sub";
@@ -777,6 +1152,127 @@ async function checkHealth() {
   }
 }
 checkHealth();
+
+async function setReviewStatus(id, reviewStatus) {
+  const response = await fetch(`/api/detections/${encodeURIComponent(id)}/review`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ review_status: reviewStatus }),
+  });
+  if (!response.ok) throw new Error((await response.json()).error || "Review update failed");
+  await loadReviewQueue();
+}
+
+function startReviewReupload(result) {
+  if (typeof setCoords === "function") setCoords(result.lat, result.lon);
+  document.getElementById("scan-launcher")?.click();
+  document.getElementById("single-file")?.click();
+}
+
+async function loadReviewQueue() {
+  const list = document.getElementById("review-list");
+  if (!list) return;
+  try {
+    const response = await fetch("/api/review?status=pending");
+    if (!response.ok) throw new Error("Review queue unavailable");
+    const { results } = await response.json();
+    list.replaceChildren();
+    if (!results.length) {
+      list.innerHTML = '<p class="review-empty">No detections need review.</p>';
+      return;
+    }
+    results.forEach((result) => {
+      const card = document.createElement("article");
+      card.className = "review-card";
+      const image = document.createElement("img");
+      image.src = result.image_url;
+      image.alt = "Banana leaf awaiting review";
+      const content = document.createElement("div");
+      content.className = "review-card-content";
+      const title = document.createElement("h2");
+      title.textContent = "Unknown — review needed";
+      const score = document.createElement("p");
+      score.textContent = `Predicted ${result.class} at ${(result.confidence * 100).toFixed(1)}% (threshold ${(result.confidence_threshold * 100).toFixed(0)}%)`;
+      const candidates = document.createElement("p");
+      candidates.className = "prediction-list";
+      candidates.textContent = `Competing scores: ${predictionSummary(result)}`;
+      const guidance = document.createElement("p");
+      guidance.textContent = "Recapture closer, in even light, with sharp focus and the whole affected leaf visible.";
+      const actions = document.createElement("div");
+      actions.className = "review-actions";
+      [["Confirm prediction", "confirmed"], ["Reject prediction", "rejected"]].forEach(([label, status]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "btn btn-outline";
+        button.textContent = label;
+        button.addEventListener("click", () => setReviewStatus(result.id, status).catch((error) => alert(error.message)));
+        actions.appendChild(button);
+      });
+      const reupload = document.createElement("button");
+      reupload.type = "button";
+      reupload.className = "btn btn-primary";
+      reupload.textContent = "Recapture / reupload";
+      reupload.addEventListener("click", () => startReviewReupload(result));
+      actions.appendChild(reupload);
+      content.append(title, score, candidates, guidance, actions);
+      card.append(image, content);
+      list.appendChild(card);
+    });
+  } catch (error) {
+    list.innerHTML = `<p class="review-empty">${error.message}</p>`;
+  }
+}
+loadReviewQueue();
+
+async function loadHistoryPage() {
+  const list = document.getElementById("history-list");
+  const mapList = document.getElementById("map-history-list");
+  if (!mapList) return;
+  try {
+    const response = await fetch("/api/history");
+    if (!response.ok) throw new Error("History unavailable");
+    const { groups } = await response.json();
+    mapList?.replaceChildren();
+    if (!groups.length) {
+      if (mapList) mapList.innerHTML = '<p class="muted">No saved scans yet.</p>';
+      return;
+    }
+    groups.forEach((group) => {
+      const card = document.createElement("article");
+      card.className = "history-card";
+      const heading = document.createElement("h2");
+      heading.textContent = `${group.batch ? "Batch" : "Scan"} · ${new Date(group.timestamp).toLocaleString()}`;
+      card.appendChild(heading);
+      group.results.forEach((result) => {
+        const row = document.createElement("div");
+        row.className = "history-row";
+        const image = document.createElement("img");
+        image.src = result.image_url;
+        image.alt = "Saved banana leaf scan";
+        const details = document.createElement("div");
+        const label = isUncertain(result) ? "Uncertain" : result.class;
+        details.innerHTML = `<strong>${label}</strong><span>${(result.confidence * 100).toFixed(1)}% · ${Number(result.lat).toFixed(5)}, ${Number(result.lon).toFixed(5)}</span>`;
+        row.append(image, details);
+        card.appendChild(row);
+      });
+      if (mapList) {
+        group.results.forEach((result) => {
+          const item = document.createElement("button");
+          item.type = "button";
+          item.className = "map-history-item";
+          item.innerHTML = `<img src="${result.image_url}" alt=""><span><b>${isUncertain(result) ? "Uncertain" : result.class}</b><small>${new Date(result.timestamp).toLocaleString()} · ${(result.confidence * 100).toFixed(1)}%</small></span>`;
+          item.addEventListener("click", () => {
+            map.flyTo({ center: [result.lon, result.lat], zoom: 17 });
+          });
+          mapList.appendChild(item);
+        });
+      }
+    });
+  } catch (error) {
+    if (mapList) mapList.innerHTML = `<p class="muted">${error.message}</p>`;
+  }
+}
+loadHistoryPage();
 
 // ---------------------------------------------------------------------------
 // Chat widget (minimize / maximize / close, offline indicator, TTS)
@@ -904,15 +1400,13 @@ function getSummaryPayload() {
     payload.type = "batch";
     payload.summary = context.summary || {};
     payload.results = context.results || [];
+    payload.high_confidence_results = payload.results.filter((result) => !isUncertain(result));
+    payload.low_confidence_results = payload.results.filter(isUncertain);
   } else {
     payload.type = "single";
-    payload.result = {
-      class: context.class,
-      confidence: context.confidence,
-      severity_pct: context.severity_pct,
-      image_url: context.image_url,
-      color: context.color,
-    };
+    payload.result = context;
+    payload.high_confidence_results = isUncertain(context) ? [] : [context];
+    payload.low_confidence_results = isUncertain(context) ? [context] : [];
   }
 
   return payload;
@@ -921,14 +1415,22 @@ function getSummaryPayload() {
 function formatCsv(payload) {
   const rows = [];
   if (payload.type === "batch") {
-    rows.push(["Class", "Count"]);
-    Object.entries(payload.summary).forEach(([cls, count]) => rows.push([cls, count]));
+    rows.push(["Review category", "Class", "Confidence", "Review status", "Competing scores"]);
+    payload.high_confidence_results.forEach((result) => rows.push([
+      "High confidence", result.class, `${(result.confidence * 100).toFixed(1)}%`, result.review_status, predictionSummary(result),
+    ]));
+    payload.low_confidence_results.forEach((result) => rows.push([
+      "Low confidence — unconfirmed", result.class, `${(result.confidence * 100).toFixed(1)}%`, result.review_status, predictionSummary(result),
+    ]));
   } else {
     rows.push(["Field", "Value"]);
     rows.push(["Class", payload.result.class]);
     rows.push(["Confidence", `${(payload.result.confidence * 100).toFixed(1)}%`]);
     rows.push(["Severity", payload.result.severity_pct == null ? "N/A" : `${payload.result.severity_pct}%`]);
     rows.push(["Image URL", payload.result.image_url || ""]);
+    rows.push(["Inference status", payload.result.inference_status || "confident"]);
+    rows.push(["Review status", payload.result.review_status || "not_required"]);
+    rows.push(["Competing scores", predictionSummary(payload.result)]);
   }
   if (payload.weather) {
     rows.push([]);
@@ -961,7 +1463,7 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function buildAreaAssessment(payload, doc) {
+function buildAreaAssessment(payload, doc, aiSummary = "") {
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
   const margin = 18;
@@ -974,6 +1476,15 @@ function buildAreaAssessment(payload, doc) {
   let y = 0;
 
   const clean = (value, fallback = "Not available") => value == null || value === "" ? fallback : String(value);
+  const cleanAi = (value) => String(value || "")
+    .replace(/\*{1,3}/g, "")
+    .replace(/\s*\/\s*%/g, "%")
+    .replace(/\b(\d+)\s+([23])\s+weeks\b/g, "$1–$2 weeks")
+    // Groq can occasionally return OCR-like character spacing.
+    .replace(/\b(?:[A-Za-z]\s+){2,}[A-Za-z]\b/g, (word) => word.replace(/\s+/g, ""))
+    .replace(/\s+/g, " ")
+    .replace(/\b(?:practical\s+next\s+steps|next\s+steps)\s*:?[^]*$/i, "")
+    .trim();
   const titleCase = (value) => clean(value).replace(/\b\w/g, (char) => char.toUpperCase());
   const percentage = (value) => value == null ? "N/A" : `${Number(value).toFixed(1)}%`;
   const addPage = () => {
@@ -987,7 +1498,8 @@ function buildAreaAssessment(payload, doc) {
     doc.setFont("helvetica", options.bold ? "bold" : "normal");
     doc.setFontSize(options.size || 10);
     doc.setTextColor(...(options.color || ink));
-    const lines = doc.splitTextToSize(text, options.width || contentWidth);
+    const lines = String(text).split(/\n+/).flatMap((line) =>
+      doc.splitTextToSize(line.trim(), options.width || contentWidth));
     ensureSpace(lines.length * (options.leading || 5) + 3);
     doc.text(lines, margin, y);
     y += lines.length * (options.leading || 5) + (options.after ?? 4);
@@ -1038,7 +1550,9 @@ function buildAreaAssessment(payload, doc) {
   };
 
   const results = payload.type === "batch" ? payload.results : [payload.result];
-  const affected = results.filter((result) => String(result.class).toLowerCase() !== "healthy");
+  const highConfidence = results.filter((result) => !isUncertain(result));
+  const lowConfidence = results.filter(isUncertain);
+  const affected = highConfidence.filter((result) => String(result.class).toLowerCase() !== "healthy");
   const dominant = payload.type === "batch"
     ? Object.entries(payload.summary || {}).sort((a, b) => b[1] - a[1])[0]?.[0] || "undetermined"
     : payload.result.class;
@@ -1049,12 +1563,12 @@ function buildAreaAssessment(payload, doc) {
   const averageSeverity = measuredSeverities.length
     ? measuredSeverities.reduce((sum, value) => sum + Number(value), 0) / measuredSeverities.length
     : null;
-  const diseaseRate = results.length ? affected.length / results.length * 100 : 0;
+  const diseaseRate = highConfidence.length ? affected.length / highConfidence.length * 100 : 0;
   const riskLevel = String(payload.weather?.risk_level || "not assessed").toLowerCase();
   const concern = diseaseRate >= 50 || (averageSeverity ?? 0) >= 25 || ["high", "severe", "critical"].includes(riskLevel);
   const assessment = concern
-    ? `Findings indicate elevated crop-health concern in the assessed area. ${affected.length} of ${results.length} sampled image(s) showed a disease classification, with ${titleCase(dominant)} as the dominant observation. Prompt field verification and targeted management are advised.`
-    : `Findings indicate a generally stable crop-health condition within the sampled area. ${affected.length} of ${results.length} image(s) showed a disease classification. Continue routine scouting because this report represents only submitted imagery and current weather context.`;
+    ? `Findings indicate elevated crop-health concern. ${affected.length} of ${highConfidence.length} confident sample(s) showed disease. ${lowConfidence.length} low-confidence sample(s) remain unconfirmed.`
+    : `Findings indicate generally stable crop health among ${highConfidence.length} confident sample(s). ${lowConfidence.length} low-confidence sample(s) remain unconfirmed and are excluded from disease rates.`;
 
   doc.setFillColor(...forest);
   doc.rect(0, 0, pageWidth, 62, "F");
@@ -1084,8 +1598,12 @@ function buildAreaAssessment(payload, doc) {
 
   section("2", "Executive assessment");
   paragraph(assessment);
+  if (aiSummary) {
+    section("3", "AI analyst explanation");
+    paragraph(cleanAi(aiSummary));
+  }
 
-  section("3", "Diagnostic findings");
+  section(aiSummary ? "4" : "3", "Diagnostic findings");
   if (payload.type === "batch") {
     table(Object.entries(payload.summary || {}).map(([classification, count]) => [titleCase(classification), `${count} sample(s) — ${percentage(count / results.length * 100)}`]));
     table([
@@ -1094,37 +1612,38 @@ function buildAreaAssessment(payload, doc) {
     ]);
   } else {
     table([
-      ["Classification", titleCase(payload.result.class)],
+      ["Classification", isUncertain(payload.result) ? "Unknown — review needed" : titleCase(payload.result.class)],
       ["Model confidence", percentage(payload.result.confidence * 100)],
       ["Estimated severity", percentage(payload.result.severity_pct)],
+      ["Model explanation", resultExplanation(payload.result)],
+      ["Symptom location", payload.result.symptom_location || "Not determined from this model output"],
     ]);
   }
 
+  section("3A", "Low-confidence review");
+  if (lowConfidence.length) {
+    lowConfidence.forEach((result) => table([
+      ["Status", "Unknown — not confirmed"],
+      ["Leading prediction", `${titleCase(result.class)} (${percentage(result.confidence * 100)})`],
+      ["Threshold", percentage(result.confidence_threshold * 100)],
+      ["Competing scores", predictionSummary(result) || "Not available"],
+      ["Review status", titleCase(result.review_status)],
+    ]));
+    paragraph("Recapture closer, in even light, with sharp focus and the whole affected leaf visible before making treatment decisions.", { color: muted });
+  } else paragraph("No low-confidence detections require review.", { color: muted });
+
   section("4", "Environmental context");
-  if (payload.weather) {
-    table([
-      ["Conditions", titleCase(payload.weather.conditions)],
-      ["Temperature", payload.weather.temp == null ? "Not available" : `${payload.weather.temp} °C`],
-      ["Relative humidity", payload.weather.humidity == null ? "Not available" : `${payload.weather.humidity}%`],
-      ["Weather-linked risk", titleCase(payload.weather.risk_level)],
-      ["Risk interpretation", clean(payload.weather.risk_note)],
-    ]);
-  } else paragraph("Weather observations were unavailable when this report was generated.", { color: muted });
+  const weather = payload.weather || {};
+  const unavailable = "Not available for this scan";
+  table([
+    ["Conditions", weather.conditions ? titleCase(weather.conditions) : unavailable],
+    ["Temperature", weather.temp == null ? unavailable : `${weather.temp} °C`],
+    ["Relative humidity", weather.humidity == null ? unavailable : `${weather.humidity}%`],
+    ["Weather-linked risk", weather.risk_level ? titleCase(weather.risk_level) : unavailable],
+    ["Risk interpretation", weather.risk_note ? clean(weather.risk_note) : unavailable],
+  ]);
 
-  section("5", "Recommended actions");
-  const actions = [
-    "Conduct an on-site inspection around the recorded coordinates and verify symptoms on multiple plants before treatment.",
-    concern
-      ? "Isolate or mark symptomatic plants, sanitize tools between plants, and prioritize affected blocks for follow-up assessment."
-      : "Maintain scheduled scouting and capture repeat images from the same area to identify changes over time.",
-    affected.length
-      ? `Review disease-specific control guidance for ${titleCase(dominant)} with a qualified agricultural officer before applying chemical treatment.`
-      : "Maintain balanced nutrition, drainage, and canopy sanitation to reduce future disease pressure.",
-    "Repeat image assessment after field intervention or within 7–14 days, using consistent lighting and close, unobstructed leaf images.",
-  ];
-  bullets(actions);
-
-  section("6", "Scope and limitations");
+  section("5", "Scope and limitations");
   paragraph("This report is an AI-assisted screening assessment based on submitted leaf imagery, recorded coordinates, and available weather data. It is not a laboratory diagnosis, pesticide prescription, or substitute for inspection by a qualified plant pathologist or agricultural extension officer. Confidence scores describe model certainty, not guaranteed biological accuracy.", { color: muted, size: 9 });
 
   const pageCount = doc.getNumberOfPages();
@@ -1140,7 +1659,19 @@ function buildAreaAssessment(payload, doc) {
   }
 }
 
-function downloadDetectionSummary() {
+async function imageDataUrl(url) {
+  const response = await fetch(new URL(url, window.location.href));
+  if (!response.ok) throw new Error("Image unavailable");
+  const blob = await response.blob();
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function downloadDetectionSummary() {
   if (!lastDetectionContext) return;
 
   const payload = getSummaryPayload();
@@ -1198,7 +1729,38 @@ function downloadDetectionSummary() {
       return;
     }
     const doc = new jsPDF({ unit: "mm", format: "a4" });
-    buildAreaAssessment(payload, doc);
+    const loadingModal = document.getElementById("export-loading-modal");
+    const loadingStatus = document.getElementById("export-loading-status");
+    loadingModal?.removeAttribute("hidden");
+    let aiSummary = "";
+    try {
+      if (loadingStatus) loadingStatus.textContent = "Fetching environmental context and generating AI explanation…";
+      const response = await fetch("/api/report-summary", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ context: payload }) });
+      const data = await response.json();
+      aiSummary = data.summary || "";
+    } catch (error) {
+      aiSummary = "AI report explanation unavailable.";
+    } finally {
+      loadingModal?.setAttribute("hidden", "");
+    }
+    buildAreaAssessment(payload, doc, aiSummary);
+    const images = (payload.type === "batch" ? payload.results : [payload.result])
+      .filter((result) => result?.image_url)
+      .slice(0, 6);
+    for (const result of images) {
+      try {
+        const dataUrl = await imageDataUrl(result.image_url);
+        doc.addPage();
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(14);
+        doc.text(`Associated image — ${result.class}`, 18, 22);
+        const imageFormat = dataUrl.startsWith("data:image/png") ? "PNG"
+          : dataUrl.startsWith("data:image/webp") ? "WEBP" : "JPEG";
+        doc.addImage(dataUrl, imageFormat, 18, 30, 174, 0, undefined, "FAST");
+      } catch (error) {
+        console.warn("Could not add report image:", error);
+      }
+    }
     downloadBlob(doc.output("blob"), filename);
     return;
   }

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scan History — SYMBIOSIS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="history-page">
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('index') }}">
+      <span class="brand-mark"><img src="{{ url_for('static', filename='img/logo.png') }}" alt="SYMBIOSIS logo"></span>
+      <span class="brand-text"><span class="brand-name">SYMBIOSIS</span><span class="brand-sub">Drone-Based Precision Agriculture</span></span>
+    </a>
+    <nav class="top-nav" aria-label="Main navigation">
+      <a href="{{ url_for('index') }}">Home</a>
+      <a href="{{ url_for('diagnose') }}">Detect</a>
+      <a href="{{ url_for('map_page') }}">Map</a>
+      <a href="{{ url_for('review_page') }}">Review</a>
+      <a href="{{ url_for('history_page') }}" class="active" aria-current="page">History</a>
+    </nav>
+  </header>
+
+  <main class="history-page-main">
+    <header class="history-page-head">
+      <span class="eyebrow">LOCAL RECORDS</span>
+      <h1>Scan history</h1>
+      <p>Previous scans ordered from newest to oldest.</p>
+      <a class="btn btn-primary" href="{{ url_for('export_history') }}">Export CSV</a>
+    </header>
+
+    <section class="history-page-grid" aria-label="Saved scans">
+      {% for result in history_results %}
+      <article class="history-page-card">
+        <img src="{{ result.image_url }}" alt="Saved banana leaf scan">
+        <div>
+          <span class="history-status{% if result.inference_status == 'uncertain' %} uncertain{% endif %}">
+            {% if result.inference_status == 'uncertain' %}Uncertain{% else %}{{ result.class|title }}{% endif %}
+          </span>
+          <h2>{{ result.class|title }}</h2>
+          <p>{{ (result.confidence * 100)|round(1) }}% confidence</p>
+          <p>{{ result.timestamp }}</p>
+          <p>{{ result.lat|round(5) }}, {{ result.lon|round(5) }}</p>
+        </div>
+      </article>
+      {% else %}
+      <p class="review-empty">No saved scans yet. Run detection first.</p>
+      {% endfor %}
+    </section>
+  </main>
+</body>
+</html>

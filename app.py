@@ -9,6 +9,9 @@ import math
 import uuid
 import asyncio
 import tempfile
+import json
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, render_template, Response, url_for
@@ -39,6 +42,18 @@ VISUALCROSSING_URL = (
     "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/"
     "timeline"
 )
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+def parse_confidence_threshold(value) -> float:
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Confidence threshold must be a number") from error
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("Confidence threshold must be between 0 and 1")
+    return threshold
+
+CONFIDENCE_THRESHOLD = parse_confidence_threshold(os.getenv("CONFIDENCE_THRESHOLD", "0.70"))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -55,6 +70,9 @@ MODEL_PATH = resolve_configured_path(
 UPLOAD_DIR = resolve_configured_path(
     os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "static", "uploads"))
 )
+DATABASE_PATH = resolve_configured_path(
+    os.getenv("DATABASE_PATH", os.path.join(BASE_DIR, "symbiosis.db"))
+)
 ALLOWED_IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 CLASS_NAMES = ["healthy", "cordana", "pestalotiopsis", "sigatoka"]
 CLASS_COLORS = {
@@ -67,6 +85,111 @@ CLASS_COLORS = {
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
+
+@contextmanager
+def database_connection():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+def init_database():
+    with database_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detections (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT,
+                filename TEXT NOT NULL,
+                disease_class TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                severity_pct REAL,
+                mock INTEGER NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                color TEXT NOT NULL,
+                weather_json TEXT,
+                created_at TEXT NOT NULL,
+                inference_status TEXT NOT NULL DEFAULT 'confident',
+                confidence_threshold REAL NOT NULL DEFAULT 0.70,
+                top_predictions_json TEXT,
+                review_status TEXT NOT NULL DEFAULT 'not_required',
+                reviewed_at TEXT
+            )
+            """
+        )
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(detections)")}
+        migrations = {
+            "inference_status": "TEXT NOT NULL DEFAULT 'confident'",
+            "confidence_threshold": "REAL NOT NULL DEFAULT 0.70",
+            "top_predictions_json": "TEXT",
+            "review_status": "TEXT NOT NULL DEFAULT 'not_required'",
+            "reviewed_at": "TEXT",
+        }
+        for column, definition in migrations.items():
+            if column not in existing:
+                connection.execute(f"ALTER TABLE detections ADD COLUMN {column} {definition}")
+        connection.execute(
+            """UPDATE detections SET
+               inference_status = CASE WHEN confidence < ? THEN 'uncertain' ELSE 'confident' END,
+               confidence_threshold = ?,
+               review_status = CASE WHEN confidence < ? THEN 'pending' ELSE 'not_required' END
+               WHERE top_predictions_json IS NULL""",
+            (CONFIDENCE_THRESHOLD, CONFIDENCE_THRESHOLD, CONFIDENCE_THRESHOLD),
+        )
+
+def save_detection(result: dict, batch_id: str | None = None):
+    result.setdefault("inference_status", "uncertain" if result["confidence"] < CONFIDENCE_THRESHOLD else "confident")
+    result.setdefault("confidence_threshold", CONFIDENCE_THRESHOLD)
+    result.setdefault("top_predictions", [{"class": result["class"], "score": result["confidence"]}])
+    result.setdefault("review_status", "pending" if result["inference_status"] == "uncertain" else "not_required")
+    with database_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO detections
+            (id, batch_id, filename, disease_class, confidence, severity_pct, mock,
+             lat, lon, color, weather_json, created_at, inference_status,
+             confidence_threshold, top_predictions_json, review_status, reviewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result["id"], batch_id, result["filename"], result["class"],
+                result["confidence"], result.get("severity_pct"), int(result.get("mock", False)),
+                result["lat"], result["lon"], result["color"],
+                json.dumps(result.get("weather")) if result.get("weather") else None,
+                result["timestamp"],
+                result["inference_status"], result["confidence_threshold"],
+                json.dumps(result.get("top_predictions", [])), result["review_status"],
+                result.get("reviewed_at"),
+            ),
+        )
+
+def detection_from_row(row):
+    return {
+        "id": row["id"],
+        "filename": row["filename"],
+        "image_url": make_image_url(row["filename"]),
+        "class": row["disease_class"],
+        "confidence": row["confidence"],
+        "severity_pct": row["severity_pct"],
+        "mock": bool(row["mock"]),
+        "lat": row["lat"],
+        "lon": row["lon"],
+        "color": row["color"],
+        "weather": json.loads(row["weather_json"]) if row["weather_json"] else None,
+        "timestamp": row["created_at"],
+        "inference_status": row["inference_status"],
+        "display_class": "unknown" if row["inference_status"] == "uncertain" else row["disease_class"],
+        "confidence_threshold": row["confidence_threshold"],
+        "top_predictions": json.loads(row["top_predictions_json"] or "[]"),
+        "review_status": row["review_status"],
+        "reviewed_at": row["reviewed_at"],
+    }
+
+init_database()
 
 # ---------------------------------------------------------------------------
 # YOLO26-seg model loading (auto-reloads weights if the file changes)
@@ -106,6 +229,31 @@ def load_model():
 
 load_model()
 
+def finalize_inference(cls_name, confidence, severity_pct, mock, predictions=None):
+    confidence = round(float(confidence), 4)
+    candidates = predictions or [{"class": cls_name, "score": confidence}]
+    candidates = sorted(candidates, key=lambda item: item["score"], reverse=True)[:3]
+    uncertain = confidence < CONFIDENCE_THRESHOLD
+    evidence = {
+        "healthy": "Model found strongest similarity to healthy-leaf examples and no supported disease class exceeded it.",
+        "cordana": "Model found strongest similarity to Cordana leaf-spot examples in its training data.",
+        "pestalotiopsis": "Model found strongest similarity to Pestalotiopsis leaf-spot examples in its training data.",
+        "sigatoka": "Model found strongest similarity to Sigatoka leaf-spot examples in its training data.",
+    }.get(cls_name, "Model selected the closest class represented in its training data.")
+    return {
+        "class": cls_name,
+        "confidence": confidence,
+        "severity_pct": severity_pct,
+        "mock": mock,
+        "inference_status": "uncertain" if uncertain else "confident",
+        "display_class": "unknown" if uncertain else cls_name,
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "top_predictions": candidates,
+        "review_status": "pending" if uncertain else "not_required",
+        "explanation": evidence if not uncertain else f"{evidence} Confidence is below the threshold, so visual evidence is insufficient for a confirmed result.",
+        "symptom_location": "Not determined from this model output",
+    }
+
 
 def run_inference(image_path: str):
     """Run the trained model on a single image. Supports both classification
@@ -126,21 +274,16 @@ def run_inference(image_path: str):
             confidence = float(r.probs.top1conf)
             cls_name = r.names.get(top_idx, CLASS_NAMES[top_idx % len(CLASS_NAMES)])
             cls_name = map_class_name(cls_name)
-            return {
-                "class": cls_name,
-                "confidence": round(confidence, 4),
-                "severity_pct": None,
-                "mock": False,
-            }
+            probabilities = r.probs.data.cpu().tolist()
+            predictions = [
+                {"class": map_class_name(r.names.get(index, str(index))), "score": round(float(score), 4)}
+                for index, score in enumerate(probabilities)
+            ]
+            return finalize_inference(cls_name, confidence, None, False, predictions)
 
         # --- Segmentation / detection model output ---
         if r.boxes is None or len(r.boxes) == 0:
-            return {
-                "class": "healthy",
-                "confidence": 1.0,
-                "severity_pct": 0.0,
-                "mock": False,
-            }
+            return finalize_inference("healthy", 1.0, 0.0, False)
         top_idx = int(r.boxes.conf.argmax())
         cls_id = int(r.boxes.cls[top_idx])
         cls_name = r.names.get(cls_id, CLASS_NAMES[cls_id % len(CLASS_NAMES)])
@@ -156,23 +299,21 @@ def run_inference(image_path: str):
             lesion_area = float(np.sum(mask > 0.5))
             severity_pct = round((lesion_area / leaf_area) * 100, 2)
 
-        return {
-            "class": cls_name,
-            "confidence": round(confidence, 4),
-            "severity_pct": severity_pct,
-            "mock": False,
-        }
+        candidates = {}
+        for class_id, score in zip(r.boxes.cls.cpu().tolist(), r.boxes.conf.cpu().tolist()):
+            name = map_class_name(r.names.get(int(class_id), str(int(class_id))))
+            candidates[name] = max(candidates.get(name, 0), float(score))
+        predictions = [{"class": name, "score": round(score, 4)} for name, score in candidates.items()]
+        return finalize_inference(cls_name, confidence, severity_pct, False, predictions)
 
     # ---- Mock fallback (no trained weights loaded yet) ----
     import random
 
     cls_name = random.choice(CLASS_NAMES)
-    return {
-        "class": cls_name,
-        "confidence": round(random.uniform(0.75, 0.97), 4),
-        "severity_pct": 0.0 if cls_name == "healthy" else round(random.uniform(5, 40), 2),
-        "mock": True,
-    }
+    return finalize_inference(
+        cls_name, random.uniform(0.75, 0.97),
+        0.0 if cls_name == "healthy" else round(random.uniform(5, 40), 2), True,
+    )
 
 
 def map_class_name(cls_name: str) -> str:
@@ -275,10 +416,81 @@ def fetch_weather(lat: float, lon: float) -> dict | None:
     except requests.exceptions.RequestException:
         return None
 
+def parse_boundary(value) -> list[tuple[float, float]]:
+    if not isinstance(value, list) or not 3 <= len(value) <= 25:
+        raise ValueError("Boundary must contain 3 to 25 points")
+    points = []
+    for point in value:
+        if not isinstance(point, dict):
+            raise ValueError("Each boundary point must contain latitude and longitude")
+        points.append(parse_coordinates(point.get("lat"), point.get("lon")))
+    return points
+
+def fetch_boundary_temperature(points: list[tuple[float, float]]) -> dict:
+    centroid = (
+        sum(point[0] for point in points) / len(points),
+        sum(point[1] for point in points) / len(points),
+    )
+    step = max(1, math.ceil(len(points) / 7))
+    sample_points = [centroid, *points[::step]][:8]
+    forecasts = []
+    for lat, lon in sample_points:
+        response = requests.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_mean,temperature_2m_min,temperature_2m_max",
+                "past_days": 7,
+                "forecast_days": 7,
+                "timezone": "auto",
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        forecasts.append(response.json()["daily"])
+
+    timeline = []
+    for index, date in enumerate(forecasts[0]["time"]):
+        means = [forecast["temperature_2m_mean"][index] for forecast in forecasts]
+        minimums = [forecast["temperature_2m_min"][index] for forecast in forecasts]
+        maximums = [forecast["temperature_2m_max"][index] for forecast in forecasts]
+        area_mean = sum(means) / len(means)
+        timeline.append({
+            "date": date,
+            "mean_c": round(area_mean, 1),
+            "min_c": round(min(minimums), 1),
+            "max_c": round(max(maximums), 1),
+            "favorable": 20 <= area_mean <= 32,
+        })
+    favorable_days = sum(day["favorable"] for day in timeline)
+    samples = []
+    for sample_index, (lat, lon) in enumerate(sample_points):
+        samples.append({
+            "lat": round(lat, 6),
+            "lon": round(lon, 6),
+            "temperatures": [round(value, 1) for value in forecasts[sample_index]["temperature_2m_mean"]],
+        })
+    return {
+        "centroid": {"lat": round(centroid[0], 6), "lon": round(centroid[1], 6)},
+        "sample_count": len(sample_points),
+        "samples": samples,
+        "timeline": timeline,
+        "summary": {
+            "favorable_days": favorable_days,
+            "total_days": len(timeline),
+            "note": f"{favorable_days} of {len(timeline)} days have area-mean temperatures within the 20–32°C disease-favorable band.",
+        },
+    }
+
 
 def format_context_for_chat(context: dict) -> str:
     if not isinstance(context, dict) or not context:
         return ""
+
+    # PDF payloads wrap one detection under `result`; use same context path as chatbot.
+    if isinstance(context.get("result"), dict):
+        context = {**context, **context["result"]}
 
     parts = []
     if context.get("batch"):
@@ -303,24 +515,45 @@ def format_context_for_chat(context: dict) -> str:
 
         return "\n".join(parts)
 
-    cls_name = context.get("class")
+    cls_name = context.get("class") or context.get("display_class")
     confidence = context.get("confidence")
-    if isinstance(cls_name, str) and isinstance(confidence, (int, float)) and math.isfinite(confidence):
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError):
+        confidence = None
+    if isinstance(cls_name, str) and confidence is not None and math.isfinite(confidence):
+        parts.append("Assessment identification: single-image field observation.")
+        parts.append(f"Detected classification: {cls_name}.")
         parts.append(
             f"Latest detection: {cls_name} with {(confidence * 100):.1f}% confidence."
         )
+        if context.get("severity_pct") is not None:
+            parts.append(f"Estimated severity: {context['severity_pct']}%.")
+        if context.get("inference_status"):
+            parts.append(f"Inference status: {context['inference_status']}.")
+        if context.get("explanation"):
+            parts.append(f"Model explanation: {context['explanation']}")
 
     weather = context.get("weather")
     if isinstance(weather, dict):
         parts.append(
-            f"Weather at the location: {weather.get('conditions', 'unknown')} with {weather.get('temp', 'N/A')}°C, humidity {weather.get('humidity', 'N/A')}%, risk level {weather.get('risk_level', 'N/A')}.")
+            f"Weather at the location: {weather.get('conditions', 'unknown')} with "
+            f"{weather.get('temp', 'N/A')}°C, humidity {weather.get('humidity', 'N/A')}%, "
+            f"risk level {weather.get('risk_level', 'N/A')}."
+        )
         if weather.get("risk_note"):
-            parts.append(f"Note: {weather.get('risk_note')}")
+            parts.append(f"Weather risk note: {weather['risk_note']}")
+    coordinates = context.get("coordinates")
+    if isinstance(coordinates, dict):
+        parts.append(f"Coordinates: {coordinates.get('lat')}, {coordinates.get('lon')}.")
+    elif context.get("lat") is not None and context.get("lon") is not None:
+        parts.append(f"Coordinates: {context['lat']}, {context['lon']}.")
 
     if parts:
         return "\n".join(parts)
 
-    return ""
+    # Keep provider from treating a valid but differently shaped payload as empty.
+    return f"Supplied report data (JSON): {json.dumps(context, default=str)}"
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +572,39 @@ def diagnose():
 @app.route("/map")
 def map_page():
     return render_template("index.html", diagnose_page=True, workspace_tab="map")
+
+@app.route("/review")
+def review_page():
+    return render_template(
+        "index.html", diagnose_page=True, review_page=True,
+        workspace_tab="review", confidence_threshold=CONFIDENCE_THRESHOLD,
+    )
+
+@app.route("/history")
+def history_page():
+    with database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM detections ORDER BY created_at DESC LIMIT 500"
+        ).fetchall()
+    return render_template(
+        "history.html", history_results=[detection_from_row(row) for row in rows]
+    )
+
+@app.get("/history/export")
+def export_history():
+    with database_connection() as connection:
+        rows = connection.execute(
+            "SELECT created_at, disease_class, confidence, inference_status, lat, lon, filename "
+            "FROM detections ORDER BY created_at DESC LIMIT 500"
+        ).fetchall()
+    lines = ["timestamp,class,confidence,status,latitude,longitude,image"]
+    for row in rows:
+        values = [row[key] for key in row.keys()]
+        escaped = ['"' + str(value or "").replace('"', '""') + '"' for value in values]
+        lines.append(",".join(escaped))
+    return Response("\n".join(lines), mimetype="text/csv", headers={
+        "Content-Disposition": "attachment; filename=symbiosis-history.csv"
+    })
 
 @app.route("/api/health")
 def health():
@@ -360,6 +626,7 @@ def health():
             "model_label_sample": label_sample,
             "assistant_configured": groq_ok,
             "weather_configured": weather_ok,
+            "confidence_threshold": CONFIDENCE_THRESHOLD,
         }
     )
 
@@ -400,6 +667,7 @@ def detect_single():
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
     )
+    save_detection(result)
     return jsonify(result)
 
 
@@ -421,6 +689,7 @@ def detect_batch():
         return jsonify({"error": "Every upload must be a supported image file (BMP, JPEG, PNG, TIFF, or WebP)"}), 400
 
     results = []
+    batch_id = uuid.uuid4().hex
     weather_data = fetch_weather(float(lat), float(lon))
     for file, ext in zip(files, extensions):
         filename = f"{uuid.uuid4().hex}{ext}"
@@ -441,6 +710,7 @@ def detect_batch():
                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
         )
+        save_detection(r, batch_id)
         results.append(r)
 
     counts = {}
@@ -448,6 +718,65 @@ def detect_batch():
         counts[r["class"]] = counts.get(r["class"], 0) + 1
 
     return jsonify({"results": results, "summary": counts})
+
+@app.get("/api/history")
+def detection_history():
+    with database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM detections ORDER BY created_at DESC LIMIT 500"
+        ).fetchall()
+
+    groups = []
+    grouped = {}
+    for row in rows:
+        key = row["batch_id"] or row["id"]
+        if key not in grouped:
+            grouped[key] = {
+                "id": key,
+                "batch": row["batch_id"] is not None,
+                "timestamp": row["created_at"],
+                "results": [],
+            }
+            groups.append(grouped[key])
+        grouped[key]["results"].append(detection_from_row(row))
+
+    for group in groups:
+        group["summary"] = {}
+        for result in group["results"]:
+            disease = result["class"]
+            group["summary"][disease] = group["summary"].get(disease, 0) + 1
+    return jsonify({"groups": groups})
+
+@app.get("/api/review")
+def review_queue():
+    status = request.args.get("status", "pending")
+    if status not in {"pending", "confirmed", "rejected"}:
+        return jsonify({"error": "Review status must be pending, confirmed, or rejected"}), 400
+    with database_connection() as connection:
+        rows = connection.execute(
+            """SELECT * FROM detections
+               WHERE inference_status = 'uncertain' AND review_status = ?
+               ORDER BY created_at DESC LIMIT 500""",
+            (status,),
+        ).fetchall()
+    return jsonify({"results": [detection_from_row(row) for row in rows]})
+
+@app.patch("/api/detections/<detection_id>/review")
+def update_detection_review(detection_id):
+    body = request.get_json(silent=True)
+    status = body.get("review_status") if isinstance(body, dict) else None
+    if status not in {"pending", "confirmed", "rejected"}:
+        return jsonify({"error": "Review status must be pending, confirmed, or rejected"}), 400
+    reviewed_at = None if status == "pending" else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with database_connection() as connection:
+        updated = connection.execute(
+            "UPDATE detections SET review_status = ?, reviewed_at = ? WHERE id = ? AND inference_status = 'uncertain'",
+            (status, reviewed_at, detection_id),
+        )
+        if updated.rowcount == 0:
+            return jsonify({"error": "Uncertain detection not found"}), 404
+        row = connection.execute("SELECT * FROM detections WHERE id = ?", (detection_id,)).fetchone()
+    return jsonify(detection_from_row(row))
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +817,17 @@ def weather():
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+@app.post("/api/spatiotemporal")
+def spatiotemporal():
+    try:
+        body = request.get_json(silent=True) or {}
+        points = parse_boundary(body.get("boundary"))
+        return jsonify(fetch_boundary_temperature(points))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (requests.exceptions.RequestException, KeyError, TypeError) as e:
+        return jsonify({"error": f"Open-Meteo data unavailable: {e}"}), 502
 
 
 # ---------------------------------------------------------------------------
@@ -545,9 +885,10 @@ def chat():
     try:
         res = requests.post(GROQ_URL, headers=headers, json=payload, timeout=15)
         if res.status_code != 200:
+            app.logger.error("Groq chat failed: %s %s", res.status_code, res.text[:500])
             return jsonify(
                 {
-                    "reply": "The assistant is temporarily unavailable, switching to offline mode.",
+                    "reply": "The assistant is temporarily unavailable. Check the server log for the provider error.",
                     "offline": True,
                 }
             )
@@ -566,6 +907,27 @@ def chat():
                 "offline": True,
             }
         )
+
+@app.post("/api/report-summary")
+def report_summary():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("context"), dict):
+        return jsonify({"error": "A report context object is required"}), 400
+    if not GROQ_API_KEY:
+        return jsonify({"summary": "AI report explanation unavailable: no API key is configured.", "offline": True})
+    context_text = format_context_for_chat(body["context"])
+    payload = {"model": GROQ_MODEL, "messages": [
+        {"role": "system", "content": "You are a banana crop health analyst writing section 3, AI Analyst Explanation, of a farmer report. Assessment identification and detected classification below are real supplied data. Base answer on them. Never say detection data is missing. Treat healthy as a valid finding. Mention classification and confidence first, then uncertainty, weather implications, and practical next steps. Do not invent symptoms, severity, causes, or locations. If weather is unavailable, say so briefly. Plain text, 180 words maximum."},
+        {"role": "user", "content": context_text},
+    ]}
+    try:
+        res = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}, json=payload, timeout=20)
+        if res.status_code != 200:
+            app.logger.error("Groq report failed: %s %s", res.status_code, res.text[:500])
+            return jsonify({"summary": "AI report explanation unavailable.", "offline": True})
+        return jsonify({"summary": res.json()["choices"][0]["message"]["content"], "offline": False})
+    except (requests.exceptions.RequestException, KeyError, TypeError, ValueError):
+        return jsonify({"summary": "AI report explanation unavailable.", "offline": True})
 
 
 # ---------------------------------------------------------------------------
