@@ -597,10 +597,7 @@ def history_page():
         {"date": result["timestamp"], "confidence": round(result["confidence"] * 100, 1), "class": result["class"]}
         for result in reversed(history_results)
     ]
-    disease_trend = {}
-    for result in chart_data:
-        disease_trend.setdefault(result["class"], []).append(result["confidence"])
-    return render_template("history.html", history_results=history_results, summary=summary, chart_data=chart_data, disease_trend=disease_trend)
+    return render_template("history.html", history_results=history_results, summary=summary, chart_data=chart_data)
 
 @app.get("/history/export")
 def export_history():

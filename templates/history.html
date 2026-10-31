@@ -29,10 +29,7 @@
       <span class="eyebrow">LOCAL RECORDS</span>
       <h1>Scan history</h1>
       <p>Previous scans ordered from newest to oldest.</p>
-      <div class="history-export-actions">
-        <a class="btn btn-primary" href="{{ url_for('export_history') }}">Export CSV</a>
-        <button class="btn btn-primary" id="history-pdf-btn" type="button">Export PDF</button>
-      </div>
+      <a class="btn btn-primary" href="{{ url_for('export_history') }}">Export CSV</a>
       <div class="history-filter" aria-label="Filter scan history">
         <label for="history-status-filter">Show</label>
         <select id="history-status-filter">
@@ -40,8 +37,6 @@
           <option value="high">High-confidence</option>
           <option value="low">Low-confidence / review</option>
         </select>
-        <label for="history-location-filter">Location</label>
-        <select id="history-location-filter"><option value="all">All locations</option>{% for result in history_results %}<option value="{{ result.lat|round(5) }},{{ result.lon|round(5) }}">{{ result.lat|round(5) }}, {{ result.lon|round(5) }}</option>{% endfor %}</select>
       </div>
     </header>
 
@@ -54,12 +49,11 @@
     <section class="history-chart-card" aria-labelledby="history-chart-title">
       <div><span class="eyebrow">TREND</span><h2 id="history-chart-title">Confidence across scans</h2><p>Each point represents one saved test, oldest to newest.</p></div>
       <canvas id="history-chart" height="260" aria-label="Line graph showing confidence across scans"></canvas>
-      <div class="disease-trend"><span class="eyebrow">CLASS COUNTS</span><div>{% for name, values in disease_trend.items() %}<span>{{ name|title }}: {{ values|length }}</span>{% endfor %}</div></div>
     </section>
 
     <section class="history-page-grid" aria-label="Saved scans">
       {% for result in history_results %}
-      <article class="history-page-card" data-confidence="{{ 'low' if result.inference_status == 'uncertain' else 'high' }}" data-location="{{ result.lat|round(5) }},{{ result.lon|round(5) }}">
+      <article class="history-page-card" data-confidence="{{ 'low' if result.inference_status == 'uncertain' else 'high' }}">
         <img src="{{ result.image_url }}" alt="Saved banana leaf scan">
         <div>
           <span class="history-status{% if result.inference_status == 'uncertain' %} uncertain{% endif %}">
@@ -69,7 +63,6 @@
           <p>{{ (result.confidence * 100)|round(1) }}% confidence</p>
           <p>{{ result.timestamp }}</p>
           <p>{{ result.lat|round(5) }}, {{ result.lon|round(5) }}</p>
-          <a class="history-map-link" href="{{ url_for('map_page') }}?lat={{ result.lat }}&lon={{ result.lon }}">View on map</a>
         </div>
       </article>
       {% else %}
@@ -79,28 +72,6 @@
   </main>
   <script>
     const chartData = {{ chart_data|tojson }};
-    const historyResults = {{ history_results|tojson }};
-    document.getElementById("history-pdf-btn").addEventListener("click", async () => {
-      const button = document.getElementById("history-pdf-btn");
-      button.disabled = true; button.textContent = "Preparing PDF…";
-      try {
-        if (!window.jspdf?.jsPDF) throw new Error("PDF library unavailable");
-        const doc = new window.jspdf.jsPDF({ unit: "mm", format: "a4" });
-        doc.setFont("helvetica", "bold"); doc.setFontSize(20); doc.text("SYMBIOSIS SCAN HISTORY", 18, 22);
-        doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.text(`Generated: ${new Date().toLocaleString()}`, 18, 30);
-        doc.text(`Total scans: {{ summary.total }}    High confidence: {{ summary.high }}    Needs review: {{ summary.low }}    Disease findings: {{ summary.diseased }}`, 18, 39);
-        let y = 52;
-        historyResults.forEach((result, index) => {
-          if (y > 275) { doc.addPage(); y = 20; }
-          doc.setFont("helvetica", "bold"); doc.text(`${index + 1}. ${String(result.class).toUpperCase()}`, 18, y);
-          doc.setFont("helvetica", "normal"); doc.text(`Confidence: ${(Number(result.confidence) * 100).toFixed(1)}% | Status: ${result.inference_status} | Date: ${result.timestamp}`, 18, y + 6);
-          doc.text(`Location: ${Number(result.lat).toFixed(5)}, ${Number(result.lon).toFixed(5)}`, 18, y + 12);
-          y += 23;
-        });
-        doc.save(`symbiosis_scan_history_${new Date().toISOString().slice(0, 10)}.pdf`);
-      } catch (error) { alert("PDF export is unavailable. Try Export CSV instead."); }
-      finally { button.disabled = false; button.textContent = "Export PDF"; }
-    });
     const canvas = document.getElementById("history-chart");
     const ctx = canvas.getContext("2d");
     const drawChart = () => {
@@ -121,11 +92,10 @@
     };
     addEventListener("resize", drawChart); drawChart();
     const filter = document.getElementById("history-status-filter");
-    const locationFilter = document.getElementById("history-location-filter");
     const cards = [...document.querySelectorAll(".history-page-card")];
-    const applyFilters = () => cards.forEach((card) => { card.hidden = (filter.value !== "all" && card.dataset.confidence !== filter.value) || (locationFilter.value !== "all" && card.dataset.location !== locationFilter.value); });
-    filter.addEventListener("change", applyFilters); locationFilter.addEventListener("change", applyFilters);
+    filter.addEventListener("change", () => cards.forEach((card) => {
+      card.hidden = filter.value !== "all" && card.dataset.confidence !== filter.value;
+    }));
   </script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 </body>
 </html>

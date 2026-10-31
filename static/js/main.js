@@ -106,26 +106,15 @@ function hideScanLoader() {
 // ---------------------------------------------------------------------------
 // Map
 // ---------------------------------------------------------------------------
-const DEFAULT_MAP_VIEW = { center: [125.17474, 6.13061], zoom: 11.5, pitch: 35, bearing: -8 };
 const map = new maplibregl.Map({
   container: "map",
   style: "https://tiles.openfreemap.org/styles/dark",
-  // General Santos City default view; history links override this with ?lat=...&lon=...
-  ...DEFAULT_MAP_VIEW,
+  center: [125.1716, 6.1164],
+  zoom: 12,
+  pitch: 35,
+  bearing: -8,
   attributionControl: false,
 });
-const mapFocus = new URLSearchParams(window.location.search);
-const focusLat = Number(mapFocus.get("lat"));
-const focusLon = Number(mapFocus.get("lon"));
-if (Number.isFinite(focusLat) && Number.isFinite(focusLon)) {
-  map.setCenter([focusLon, focusLat]);
-  map.setZoom(15);
-} else {
-  // Reapply after style load; basemap style must not decide camera position.
-  const restoreDefaultView = () => map.jumpTo(DEFAULT_MAP_VIEW);
-  map.once("load", restoreDefaultView);
-  map.on("style.load", restoreDefaultView);
-}
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-left");
 map.addControl(new maplibregl.AttributionControl({ compact: true }));
 
@@ -146,10 +135,6 @@ document.querySelectorAll("[data-map-style]").forEach((button) => {
     });
   });
 });
-document.querySelector('[data-map-style="dark"]')?.classList.add("active");
-document.querySelector('[data-map-style="dark"]')?.setAttribute("aria-pressed", "true");
-document.querySelector('[data-map-style="positron"]')?.classList.remove("active");
-document.querySelector('[data-map-style="positron"]')?.setAttribute("aria-pressed", "false");
 
 function createMarkerLayer() {
   return { markers: new Set(), visible: true };
