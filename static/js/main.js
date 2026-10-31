@@ -108,7 +108,7 @@ function hideScanLoader() {
 // ---------------------------------------------------------------------------
 const map = new maplibregl.Map({
   container: "map",
-  style: "https://tiles.openfreemap.org/styles/positron",
+  style: "https://tiles.openfreemap.org/styles/dark",
   // General Santos City default view; history links override this with ?lat=...&lon=...
   center: [125.1716, 6.1164],
   zoom: 11.5,
@@ -146,10 +146,10 @@ document.querySelectorAll("[data-map-style]").forEach((button) => {
     });
   });
 });
-document.querySelector('[data-map-style="positron"]')?.classList.add("active");
-document.querySelector('[data-map-style="positron"]')?.setAttribute("aria-pressed", "true");
-document.querySelector('[data-map-style="liberty"]')?.classList.remove("active");
-document.querySelector('[data-map-style="liberty"]')?.setAttribute("aria-pressed", "false");
+document.querySelector('[data-map-style="dark"]')?.classList.add("active");
+document.querySelector('[data-map-style="dark"]')?.setAttribute("aria-pressed", "true");
+document.querySelector('[data-map-style="positron"]')?.classList.remove("active");
+document.querySelector('[data-map-style="positron"]')?.setAttribute("aria-pressed", "false");
 
 function createMarkerLayer() {
   return { markers: new Set(), visible: true };
