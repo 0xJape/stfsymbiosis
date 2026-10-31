@@ -106,14 +106,12 @@ function hideScanLoader() {
 // ---------------------------------------------------------------------------
 // Map
 // ---------------------------------------------------------------------------
+const DEFAULT_MAP_VIEW = { center: [125.17474, 6.13061], zoom: 11.5, pitch: 35, bearing: -8 };
 const map = new maplibregl.Map({
   container: "map",
   style: "https://tiles.openfreemap.org/styles/dark",
   // General Santos City default view; history links override this with ?lat=...&lon=...
-  center: [125.17474, 6.13061],
-  zoom: 11.5,
-  pitch: 35,
-  bearing: -8,
+  ...DEFAULT_MAP_VIEW,
   attributionControl: false,
 });
 const mapFocus = new URLSearchParams(window.location.search);
@@ -123,8 +121,10 @@ if (Number.isFinite(focusLat) && Number.isFinite(focusLon)) {
   map.setCenter([focusLon, focusLat]);
   map.setZoom(15);
 } else {
-  // Force default on every fresh map page load; prevents browser/map state from restoring elsewhere.
-  map.on("load", () => map.jumpTo({ center: [125.17474, 6.13061], zoom: 11.5, pitch: 35, bearing: -8 }));
+  // Reapply after style load; basemap style must not decide camera position.
+  const restoreDefaultView = () => map.jumpTo(DEFAULT_MAP_VIEW);
+  map.once("load", restoreDefaultView);
+  map.on("style.load", restoreDefaultView);
 }
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "bottom-left");
 map.addControl(new maplibregl.AttributionControl({ compact: true }));
