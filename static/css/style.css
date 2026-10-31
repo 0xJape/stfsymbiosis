@@ -1126,6 +1126,7 @@ body {
 .export-loading-card { text-align:center; }
 .export-spinner { position:relative; width:42px; height:42px; margin:24px auto; border:3px solid rgba(169,201,164,.22); border-top-color:var(--sage-200); border-radius:50%; animation:export-spin .8s linear infinite; }
 .history-filter { display:flex; align-items:center; gap:10px; margin-top:18px; color:var(--sage-200); font-size:.85rem; }
+.history-export-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
 .history-filter select { padding:9px 12px; border:1px solid rgba(169,201,164,.28); border-radius:8px; color:var(--sage-100); background:#102619; }
 .history-page-card[hidden] { display:none; }
 .history-map-link { color:var(--sage-200); font-size:.8rem; }
